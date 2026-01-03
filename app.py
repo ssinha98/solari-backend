@@ -894,6 +894,87 @@ def jira_search():
         logger.error(f"Jira search error: {str(e)}")
         return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
 
+@app.route("/api/jira/workspaces", methods=["GET"])
+@require_solari_key
+def jira_get_workspaces():
+    """
+    Returns a list of Jira workspaces (cloud sites) that the authenticated user has access to.
+    Requires: user_id query parameter
+    
+    Usage:
+        GET /api/jira/workspaces?user_id=test_user_123
+    
+    Response:
+        {
+            "status": "success",
+            "workspaces": [
+                {
+                    "name": "My Jira Site",
+                    "url": "https://solariai.atlassian.net",
+                    "cloudId": "7ad8f09d-6dc0-444a-acf1-f55b3666dbb6",
+                    "scopes": ["read:jira-work", "write:jira-work"]
+                },
+                ...
+            ]
+        }
+    """
+    user_id = request.args.get("user_id")
+    
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    
+    try:
+        # --- Get credentials from Firestore ---
+        creds = _get_jira_creds(user_id)
+        access_token = creds["access_token"]
+        
+        # --- Call Jira to get accessible resources ---
+        url = "https://api.atlassian.com/oauth/token/accessible-resources"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers)
+        
+        # TODO: If token expired, implement token refresh logic here
+        # if response.status_code == 401:
+        #     new_access = _refresh_access_token(user_id, creds["refresh_token"])
+        #     headers["Authorization"] = f"Bearer {new_access}"
+        #     response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch Jira workspaces: {response.text}")
+            return jsonify({
+                "status": "failure",
+                "error": f"Failed to fetch Jira workspaces: {response.text}"
+            }), 400
+        
+        workspaces = response.json()
+        
+        # Filter to only Jira sites (not Confluence, etc.)
+        jira_sites = [
+            {
+                "name": w.get("name"),
+                "url": w.get("url"),
+                "cloudId": w.get("id"),
+                "scopes": w.get("scopes", [])
+            }
+            for w in workspaces if "jira" in ",".join(w.get("scopes", [])).lower()
+        ]
+        
+        return jsonify({
+            "status": "success",
+            "workspaces": jira_sites
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Jira workspaces error: {str(e)}")
+        return jsonify({
+            "status": "failure",
+            "error": str(e)
+        }), 500
+
 @app.route('/api/firebase/test', methods=['GET'])
 @require_solari_key
 def test_firebase():
