@@ -487,7 +487,6 @@ def status():
     }), 200
 
 @app.route("/auth/jira/connect", methods=['GET'])
-@require_solari_key
 def jira_connect():
     """
     Step 1: Redirect user to Atlassian OAuth screen to approve access.
