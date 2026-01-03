@@ -3,8 +3,9 @@ import json
 import io
 import tempfile
 import time
+from datetime import datetime, timedelta
 from typing import Optional
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, jsonify, request, make_response, redirect
 from werkzeug.exceptions import BadRequest
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -24,6 +25,8 @@ import re
 import difflib
 from typing import Any, Dict, List, Tuple, Optional
 from functools import wraps
+from urllib.parse import urlencode
+import requests
 # from typing import List
 # Load environment variables from .env file
 load_dotenv()
@@ -112,6 +115,10 @@ def get_all_env_vars() -> dict:
         Dictionary of all environment variables
     """
     return dict(os.environ)
+
+# Jira OAuth Configuration
+ATLASSIAN_REDIRECT_URI = 'https://solari-backend.onrender.com/auth/jira/callback'
+FRONTEND_SUCCESS_URL = os.getenv('FRONTEND_SUCCESS_URL', 'http://localhost:3000')
 
 # Security: Solari Key validation
 SOLARI_INTERNAL_KEY = os.environ.get("SOLARI_INTERNAL_KEY")
@@ -478,6 +485,414 @@ def status():
         'status': 'success',
         'message': 'API is operational'
     }), 200
+
+@app.route("/auth/jira/connect", methods=['GET'])
+@require_solari_key
+def jira_connect():
+    """
+    Step 1: Redirect user to Atlassian OAuth screen to approve access.
+    
+    Usage: GET /auth/jira/connect?uid={user_id}&client_id={jira_client_id}
+    """
+    uid = request.args.get("uid")
+    client_id = request.args.get("client_id")
+    
+    if not uid:
+        return jsonify({"error": "Missing uid parameter"}), 400
+    
+    if not client_id:
+        return jsonify({"error": "Missing client_id parameter"}), 400
+    
+    query_params = {
+        "audience": "api.atlassian.com",
+        "client_id": client_id,
+        "scope": "read:jira-work offline_access",
+        "redirect_uri": ATLASSIAN_REDIRECT_URI,
+        "response_type": "code",
+        "prompt": "consent",
+        "state": uid  # ✅ safely carries the user ID through OAuth
+    }
+    
+    auth_url = "https://auth.atlassian.com/authorize?" + urlencode(query_params)
+    return redirect(auth_url)
+
+@app.route("/auth/jira/callback", methods=['GET'])
+def jira_oauth_callback():
+    """
+    OAuth callback from Atlassian after user approves access.
+    This endpoint is called by Atlassian after user authorizes the app.
+    """
+    # 1. Get ?code= from Atlassian redirect
+    code = request.args.get("code")
+    uid = request.args.get("state")  # ✅ state contains user_id from connect step
+
+    logger.info(f"Callback received - code: {bool(code)}, uid: {uid}")
+
+    if not code:
+        return jsonify({"error": "Missing ?code in callback URL"}), 400
+    if not uid:
+        return jsonify({"error": "Missing uid in OAuth state parameter"}), 400
+
+    # For testing: Get client credentials from environment variables
+    # TODO: In production, get these from Firebase using the uid
+    client_id = os.getenv('JIRA_CLIENT_ID')
+    client_secret = os.getenv('JIRA_CLIENT_SECRET')
+    
+    if not client_id or not client_secret:
+        return jsonify({"error": "Jira client credentials not configured"}), 500
+
+    # 2. Exchange code for access + refresh tokens
+    token_url = "https://auth.atlassian.com/oauth/token"
+    token_payload = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "redirect_uri": ATLASSIAN_REDIRECT_URI,
+    }
+
+    try:
+        token_res = requests.post(token_url, json=token_payload)
+        if token_res.status_code != 200:
+            logger.error(f"Token exchange failed: {token_res.text}")
+            return jsonify({"error": "Failed to exchange code for tokens", "details": token_res.json()}), 400
+
+        token_data = token_res.json()
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        expires_in = token_data.get("expires_in", 3600)  # ≈1 hour
+
+        logger.info(f"Got tokens - access_token: {bool(access_token)}, refresh_token: {bool(refresh_token)}")
+        logger.info(f"Access token: {access_token}")
+        logger.info(f"Refresh token: {refresh_token}")
+
+        # 3. Get user's Jira Cloud ID
+        resources_url = "https://api.atlassian.com/oauth/token/accessible-resources"
+        resources_res = requests.get(
+            resources_url,
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+
+        if resources_res.status_code != 200:
+            logger.error(f"Failed to fetch resources: {resources_res.text}")
+            return jsonify({"error": "Failed to fetch Jira cloud ID", "details": resources_res.json()}), 400
+
+        resources = resources_res.json()
+        if not resources:
+            return jsonify({"error": "No Jira site accessible with this account"}), 400
+
+        jira_site = resources[0]
+        cloud_id = jira_site.get("id")
+        jira_site_url = jira_site.get("url")
+
+        logger.info(f"Got Jira info - cloud_id: {cloud_id}, site_url: {jira_site_url}")
+
+        # 4. ✅ Save tokens securely to Firestore
+        try:
+            db = firestore.client()
+            db.collection("users").document(uid).set({
+                "jira_access_token": access_token,
+                "jira_refresh_token": refresh_token,
+                "jira_cloud_id": cloud_id,
+                "jira_site_url": jira_site_url,
+                "jira_connected": True,
+                "jira_connected_at": firestore.SERVER_TIMESTAMP,
+                "jira_expires_at": datetime.utcnow() + timedelta(seconds=expires_in)
+            }, merge=True)
+            logger.info(f"✅ Jira OAuth saved in Firestore for user {uid}")
+        except Exception as e:
+            logger.error(f"Failed to save OAuth tokens for user {uid}: {str(e)}")
+            return jsonify({"error": "Failed to save OAuth credentials"}), 500
+
+        # Return success response (without tokens for security)
+        return jsonify({
+            "success": True,
+            "message": "Jira OAuth successful",
+            "uid": uid,
+            "cloud_id": cloud_id,
+            "jira_site_url": jira_site_url
+        }), 200
+
+        # 5. Redirect user back to frontend with success message
+        # return redirect(f"{FRONTEND_SUCCESS_URL}?status=jira_connected")
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error during OAuth callback: {str(e)}")
+        return jsonify({"error": f"OAuth request failed: {str(e)}"}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error during OAuth callback: {str(e)}")
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
+# ============================================================================
+# JIRA TICKET QUERY CODE (using OAuth credentials)
+# ============================================================================
+
+def _get_jira_creds(user_id: str):
+    """
+    Retrieve Jira OAuth credentials from Firestore for a user.
+    
+    Returns:
+        dict with keys: access_token, cloud_id, site_url
+    Raises:
+        Exception if user not found or credentials missing
+    """
+    db = firestore.client()
+    user_doc = db.collection("users").document(user_id).get()
+    
+    if not user_doc.exists:
+        raise Exception(f"User {user_id} not found in Firestore")
+    
+    user_data = user_doc.to_dict() or {}
+    access_token = user_data.get("jira_access_token")
+    cloud_id = user_data.get("jira_cloud_id")
+    
+    if not access_token or not cloud_id:
+        raise Exception(f"Jira credentials not found for user {user_id}. Please complete OAuth flow.")
+    
+    return {
+        "access_token": access_token,
+        "cloud_id": cloud_id,
+        "site_url": user_data.get("jira_site_url")
+    }
+
+def _jira_request(user_id: str, method: str, endpoint: str, params: dict = None, json_body: dict = None):
+    """
+    Make an authenticated request to Jira API.
+    
+    Args:
+        user_id: Firebase user ID
+        method: HTTP method (GET, POST, etc.)
+        endpoint: API endpoint path (e.g., "/rest/api/3/issue/picker")
+        params: Query parameters (for GET requests)
+        json_body: JSON body (for POST requests)
+    
+    Returns:
+        Response JSON data
+    Raises:
+        Exception on request failure
+    """
+    creds = _get_jira_creds(user_id)
+    access_token = creds["access_token"]
+    cloud_id = creds["cloud_id"]
+    
+    # Construct Jira API URL: https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/...
+    base_url = f"https://api.atlassian.com/ex/jira/{cloud_id}"
+    url = f"{base_url}{endpoint}"
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json"
+    }
+    
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    
+    response = requests.request(
+        method=method,
+        url=url,
+        headers=headers,
+        params=params,
+        json=json_body
+    )
+    
+    if response.status_code >= 400:
+        error_msg = f"Jira API error ({response.status_code}): {response.text}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    return response.json()
+
+def _search_by_picker(user_id: str, query_text: str):
+    """
+    Simple search using the Issue Picker endpoint.
+    Returns list of numeric IDs as strings.
+    Good for plain text searches like "PROJ-123" or "bug in login"
+    """
+    data = _jira_request(
+        user_id,
+        "GET",
+        "/rest/api/3/issue/picker",
+        params={"query": query_text},
+    )
+    ids = []
+    for section in data.get("sections", []):
+        for issue in section.get("issues", []):
+            # picker returns numeric ID, ensure str for consistency
+            if "id" in issue:
+                ids.append(str(issue["id"]))
+    return ids
+
+def _search_by_jql(user_id: str, jql: str, max_results: int = 20):
+    """
+    JQL search via the new endpoint. Returns list of string IDs.
+    Note: We're using POST /search/jql (required by latest API).
+    
+    Examples:
+    - "project = PROJ"
+    - "project = PROJ AND status = 'In Progress'"
+    - "assignee = currentUser() AND created >= -7d"
+    """
+    body = {"jql": jql, "maxResults": max_results}
+    data = _jira_request(user_id, "POST", "/rest/api/3/search/jql", json_body=body)
+    issues = data.get("issues", [])
+    return [i.get("id") for i in issues if i.get("id")]
+
+def _get_issue(user_id: str, issue_id_or_key: str):
+    """
+    Fetch full details for a specific issue by ID or key.
+    Examples: "12345" (ID) or "PROJ-123" (key)
+    """
+    return _jira_request(user_id, "GET", f"/rest/api/3/issue/{issue_id_or_key}")
+
+def _filter_ticket_fields(ticket_data):
+    """
+    Filter ticket data to keep only specific fields.
+    Accepts list of issues or a single issue dict.
+    """
+    fields_to_keep = [
+        "assignee", "attachment", "comment", "created", "creator",
+        "duedate", "issuetype", "priority", "project", "status",
+        "summary", "subtasks",
+    ]
+    top_level_fields = ["id", "key", "self"]
+    
+    def _filter_one(ticket: dict):
+        out = {}
+        for k in top_level_fields:
+            if k in ticket:
+                out[k] = ticket[k]
+        if "fields" in ticket:
+            out["fields"] = {}
+            for k in fields_to_keep:
+                if k in ticket["fields"]:
+                    out["fields"][k] = ticket["fields"][k]
+        return out
+    
+    if isinstance(ticket_data, list):
+        return [_filter_one(t) for t in ticket_data]
+    return _filter_one(ticket_data)
+
+def get_filtered_full_ticket_info_oauth(search_input: str, search_type: str, user_id: str):
+    """
+    Main function to query Jira tickets using OAuth credentials.
+    
+    Args:
+        search_input: JQL query or plain text search string
+        search_type: 'jql' or 'query'
+        user_id: Firebase user ID (used to retrieve OAuth credentials)
+    
+    Returns:
+        {
+            "success": True/False,
+            "data": [list of filtered ticket objects],
+            "ticket_count": int,
+            "query_type": "JQL" or "Search Query",
+            "error": str (if success=False)
+        }
+    
+    Examples:
+        # JQL search
+        result = get_filtered_full_ticket_info_oauth(
+            "project = PROJ AND status = 'In Progress'",
+            "jql",
+            "test_user_123"
+        )
+        
+        # Plain text search
+        result = get_filtered_full_ticket_info_oauth(
+            "PROJ-123",
+            "query",
+            "test_user_123"
+        )
+    """
+    try:
+        if not search_input:
+            return {"success": False, "error": "search_input is required"}
+        search_type_norm = (search_type or "").strip().lower()
+        if search_type_norm not in ("jql", "query"):
+            return {"success": False, "error": "search_type must be 'jql' or 'query'"}
+        
+        # Step 1: Search for ticket IDs
+        if search_type_norm == "jql":
+            ticket_ids = _search_by_jql(user_id, search_input)
+            query_label = "JQL"
+        else:
+            ticket_ids = _search_by_picker(user_id, search_input)
+            query_label = "Search Query"
+        
+        # Step 2: Fetch full issue details for each ID
+        details = []
+        for issue_id in ticket_ids:
+            try:
+                details.append(_get_issue(user_id, issue_id))
+            except Exception as e:
+                # continue on per-issue failure
+                logger.warning(f"Failed fetching issue {issue_id}: {e}")
+        
+        # Step 3: Filter fields and return
+        filtered = _filter_ticket_fields(details)
+        return {
+            "success": True,
+            "data": filtered,
+            "ticket_count": len(filtered),
+            "query_type": query_label,
+        }
+    
+    except Exception as e:
+        return {"success": False, "error": f"Request failed: {str(e)}"}
+
+@app.route("/api/jira/search", methods=["POST"])
+@require_solari_key
+def jira_search():
+    """
+    HTTP endpoint to search Jira tickets.
+    
+    Request Body:
+    {
+      "user_id": "firebase_uid",
+      "search_type": "jql" | "query",
+      "search_input": "<JQL or plain text>"
+    }
+    
+    Response:
+    {
+      "status": "success" | "failure",
+      "data": [ticket objects],
+      "ticket_count": int,
+      "query_type": "JQL" | "Search Query",
+      "error": str (if failure)
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        user_id = body.get("user_id")
+        search_input = body.get("search_input")
+        search_type = body.get("search_type")  # "jql" or "query"
+        
+        if not user_id:
+            return jsonify({"status": "failure", "error": "user_id is required"}), 400
+        
+        if not search_input:
+            return jsonify({"status": "failure", "error": "search_input is required"}), 400
+        
+        if (search_type or "").lower() not in ("jql", "query"):
+            return jsonify({"status": "failure", "error": "search_type must be 'jql' or 'query'"}), 400
+        
+        result = get_filtered_full_ticket_info_oauth(search_input, search_type, user_id)
+        
+        if result.get("success"):
+            return jsonify({
+                "status": "success",
+                "data": result["data"],
+                "ticket_count": result["ticket_count"],
+                "query_type": result["query_type"],
+            }), 200
+        else:
+            return jsonify({"status": "failure", "error": result.get("error", "Unknown error")}), 500
+    
+    except Exception as e:
+        logger.error(f"Jira search error: {str(e)}")
+        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
 
 @app.route('/api/firebase/test', methods=['GET'])
 @require_solari_key
