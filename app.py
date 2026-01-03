@@ -604,16 +604,16 @@ def jira_oauth_callback():
             return jsonify({"error": "Failed to save OAuth credentials"}), 500
 
         # Return success response (without tokens for security)
-        return jsonify({
-            "success": True,
-            "message": "Jira OAuth successful",
-            "uid": uid,
-            "cloud_id": cloud_id,
-            "jira_site_url": jira_site_url
-        }), 200
+        # return jsonify({
+        #     "success": True,
+        #     "message": "Jira OAuth successful",
+        #     "uid": uid,
+        #     "cloud_id": cloud_id,
+        #     "jira_site_url": jira_site_url
+        # }), 200
 
         # 5. Redirect user back to frontend with success message
-        # return redirect(f"{FRONTEND_SUCCESS_URL}?status=jira_connected")
+        return redirect(f"{FRONTEND_SUCCESS_URL}?status=jira_connected")
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Request error during OAuth callback: {str(e)}")
