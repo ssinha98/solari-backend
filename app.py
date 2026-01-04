@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Tuple, Optional
 from functools import wraps
 from urllib.parse import urlencode
 import requests
+import secrets
+
 # from typing import List
 # Load environment variables from .env file
 load_dotenv()
@@ -4496,13 +4498,128 @@ def confluence_get_full_page():
 
 
 # SLACK INTEGRATION WORK 
-@app.get("/slack/oauth/callback")
-def slack_oauth_debug():
-    print("=== Slack OAuth Callback ===")
-    print("Query params:", dict(request.args))
-    print("===========================")
 
-    return "Slack OAuth callback received. Check server logs."
+SLACK_CLIENT_ID = os.environ["SLACK_CLIENT_ID"]
+SLACK_CLIENT_SECRET = os.environ["SLACK_CLIENT_SECRET"]
+SLACK_REDIRECT_URI = os.environ["SLACK_REDIRECT_URI"]
+
+# Your scopes (comma-separated string)
+SLACK_SCOPES = ",".join([
+    "app_mentions:read",
+    "assistant:write",
+    "channels:history",
+    "channels:join",
+    "channels:read",
+    "commands",
+    "groups:history",
+])
+
+def build_slack_authorize_url(state: str) -> str:
+    return (
+        "https://slack.com/oauth/v2/authorize"
+        f"?client_id={SLACK_CLIENT_ID}"
+        f"&scope={SLACK_SCOPES}"
+        f"&redirect_uri={SLACK_REDIRECT_URI}"
+        f"&state={state}"
+    )
+@require_solari_key
+@app.post("/slack/start_auth")
+def slack_start_auth():
+    db = firestore.client()
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"ok": False, "error": "Request body is required"}), 400
+        
+        uid = data.get('userid')
+        if not uid:
+            return jsonify({"ok": False, "error": "userid parameter is required"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+
+    state = secrets.token_urlsafe(24)
+    created_at = int(time.time())
+
+    db.collection("oauth_states").document(state).set({
+        "uid": uid,
+        "created_at": created_at,
+        "provider": "slack",
+    })
+
+    authorize_url = build_slack_authorize_url(state)
+
+    return jsonify({
+        "ok": True,
+        "authorize_url": authorize_url,
+        "state": state,  # keep for debugging; you can remove later
+    })
+
+@app.get("/slack/oauth/callback")
+def slack_oauth_callback():
+    db = firestore.client()
+    state = request.args.get("state", "")
+    code = request.args.get("code", "")
+    error = request.args.get("error")
+
+    if error:
+        return f"Slack OAuth error: {error}", 400
+
+    if not state or not code:
+        return "Missing state or code", 400
+
+    # 1. Validate state
+    state_ref = db.collection("oauth_states").document(state)
+    snap = state_ref.get()
+    if not snap.exists:
+        return "Invalid state", 400
+
+    data = snap.to_dict() or {}
+    uid = data.get("uid")
+    created_at = int(data.get("created_at", 0))
+
+    # Expire after 10 minutes
+    if int(time.time()) - created_at > 600:
+        state_ref.delete()
+        return "State expired. Please retry.", 400
+
+    # One-time use
+    state_ref.delete()
+
+    # 2. Exchange code -> token
+    token_resp = requests.post(
+        "https://slack.com/api/oauth.v2.access",
+        data={
+            "code": code,
+            "redirect_uri": SLACK_REDIRECT_URI,
+        },
+        auth=(SLACK_CLIENT_ID, SLACK_CLIENT_SECRET),
+        timeout=30,
+    ).json()
+
+    if not token_resp.get("ok"):
+        print("Slack token exchange failed:", token_resp)
+        return "Slack token exchange failed. Check logs.", 400
+
+    # 3. Store installation
+    bot_token = token_resp["access_token"]
+    team = token_resp.get("team") or {}
+    team_id = team.get("id")
+
+    db.collection("users").document(uid).collection("slack_installations").document(team_id).set({
+        "team": team,
+        "team_id": team_id,
+        "bot_token": bot_token,   # encrypt later
+        "scope": token_resp.get("scope"),
+        "installed_at": int(time.time()),
+        "provider": "slack",
+    }, merge=True)
+
+    # 4. Redirect user back to frontend settings page
+    return redirect(
+        "https://solari-frontend-prod.vercel.app/settings",
+        code=302
+    )
 
 if __name__ == '__main__':
     # Get port from environment or default to 5000
