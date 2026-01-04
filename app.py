@@ -503,14 +503,24 @@ def jira_connect():
         return jsonify({"error": "Missing client_id parameter"}), 400
     
     query_params = {
-        "audience": "api.atlassian.com",
-        "client_id": client_id,
-        "scope": "read:jira-work offline_access",
-        "redirect_uri": ATLASSIAN_REDIRECT_URI,
-        "response_type": "code",
-        "prompt": "consent",
-        "state": uid  # ✅ safely carries the user ID through OAuth
-    }
+    "audience": "api.atlassian.com",
+    "client_id": client_id,
+    "scope": (
+        "offline_access "
+        "read:jira-work "
+        "read:confluence-space.summary "
+        "read:confluence-props "
+        "read:confluence-content.all "
+        "read:confluence-content.summary "
+        "search:confluence "
+        "read:space:confluence "
+        "read:page:confluence"
+    ),
+    "redirect_uri": ATLASSIAN_REDIRECT_URI,
+    "response_type": "code",
+    "prompt": "consent",
+    "state": uid,
+        }
     
     auth_url = "https://auth.atlassian.com/authorize?" + urlencode(query_params)
     return redirect(auth_url)
@@ -626,9 +636,114 @@ def jira_oauth_callback():
 # JIRA TICKET QUERY CODE (using OAuth credentials)
 # ============================================================================
 
+def _refresh_jira_access_token(user_id: str, refresh_token: str) -> dict:
+    """
+    Refresh Jira access token using refresh token.
+    
+    Args:
+        user_id: Firebase user ID
+        refresh_token: Jira refresh token
+    
+    Returns:
+        dict with new access_token, refresh_token, expires_in
+    
+    Raises:
+        Exception if refresh fails
+    """
+    client_id = os.getenv('JIRA_CLIENT_ID')
+    client_secret = os.getenv('JIRA_CLIENT_SECRET')
+    
+    if not client_id or not client_secret:
+        raise Exception("Jira client credentials not configured")
+    
+    token_url = "https://auth.atlassian.com/oauth/token"
+    token_payload = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token
+    }
+    
+    response = requests.post(token_url, json=token_payload)
+    
+    if response.status_code != 200:
+        error_msg = f"Failed to refresh access token: {response.text}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    token_data = response.json()
+    return {
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token", refresh_token),  # May not be returned
+        "expires_in": token_data.get("expires_in", 3600)
+    }
+
+def get_atlassian_access_token(user_id: str) -> str:
+    """
+    Get a valid Atlassian access token for a user, refreshing if expired.
+    
+    Args:
+        user_id: Firebase user ID
+    
+    Returns:
+        Valid access token string
+    
+    Raises:
+        Exception if user not found, credentials missing, or refresh fails
+    """
+    db = firestore.client()
+    doc_ref = db.collection("users").document(user_id)
+    doc = doc_ref.get()
+    
+    if not doc.exists:
+        raise Exception(f"User {user_id} not found in Firestore")
+    
+    user_data = doc.to_dict() or {}
+    access_token = user_data.get("jira_access_token")
+    refresh_token = user_data.get("jira_refresh_token")
+    expires_at = user_data.get("jira_expires_at")
+    
+    if not access_token or not refresh_token:
+        raise Exception(f"Jira credentials not found for user {user_id}. Please complete OAuth flow.")
+    
+    # Check if token is expired
+    # expires_at is a Firestore timestamp, convert to datetime if needed
+    if expires_at:
+        if hasattr(expires_at, 'timestamp'):  # Firestore Timestamp
+            expires_datetime = datetime.fromtimestamp(expires_at.timestamp())
+        elif isinstance(expires_at, datetime):
+            expires_datetime = expires_at
+        else:
+            # Assume it's already a datetime
+            expires_datetime = expires_at
+        
+        # Add 60 second buffer to refresh before actual expiration
+        if datetime.utcnow() >= (expires_datetime - timedelta(seconds=60)):
+            logger.info(f"Access token expired for user {user_id}, refreshing...")
+            
+            # Refresh the token
+            new_tokens = _refresh_jira_access_token(user_id, refresh_token)
+            new_access_token = new_tokens["access_token"]
+            new_refresh_token = new_tokens.get("refresh_token", refresh_token)
+            expires_in = new_tokens.get("expires_in", 3600)
+            
+            # Update Firestore with new tokens
+            doc_ref.update({
+                "jira_access_token": new_access_token,
+                "jira_refresh_token": new_refresh_token,
+                "jira_expires_at": datetime.utcnow() + timedelta(seconds=expires_in)
+            })
+            
+            logger.info(f"Successfully refreshed access token for user {user_id}")
+            return new_access_token
+    
+    # Token is still valid
+    return access_token
+
 def _get_jira_creds(user_id: str):
     """
     Retrieve Jira OAuth credentials from Firestore for a user.
+    Automatically refreshes token if expired.
     
     Returns:
         dict with keys: access_token, cloud_id, site_url
@@ -642,11 +757,13 @@ def _get_jira_creds(user_id: str):
         raise Exception(f"User {user_id} not found in Firestore")
     
     user_data = user_doc.to_dict() or {}
-    access_token = user_data.get("jira_access_token")
     cloud_id = user_data.get("jira_cloud_id")
     
-    if not access_token or not cloud_id:
+    if not cloud_id:
         raise Exception(f"Jira credentials not found for user {user_id}. Please complete OAuth flow.")
+    
+    # Get valid access token (refreshes if needed)
+    access_token = get_atlassian_access_token(user_id)
     
     return {
         "access_token": access_token,
@@ -4028,6 +4145,354 @@ def handle_rag_message():
             'error': f'Failed to handle RAG message: {str(e)}'
         }), 500
 
+@app.route("/api/confluence/spaces", methods=["GET"])
+@require_solari_key
+def confluence_get_spaces():
+    """
+    Get all Confluence spaces for the authenticated user.
+    
+    Query Parameters:
+        user_id (required): Firebase user ID
+    
+    Usage:
+        GET /api/confluence/spaces?user_id=test_user_123
+    
+    Response:
+        {
+            "status": "success",
+            "spaces": [...],
+            "space_count": int
+        }
+    """
+    user_id = request.args.get("user_id")
+    
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    
+    try:
+        # Get credentials from Firestore (same as Jira - uses Atlassian OAuth)
+        creds = _get_jira_creds(user_id)
+        access_token = creds["access_token"]
+        cloud_id = creds["cloud_id"]
+        
+        # Build Confluence API v2 URL
+        url = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/spaces"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch Confluence spaces: {response.text}")
+            return jsonify({
+                "status": "failure",
+                "error": f"Failed to fetch Confluence spaces: {response.text}"
+            }), 400
+        
+        data = response.json()
+        
+        # Return all spaces
+        spaces = data.get("results", [])
+        return jsonify({
+            "status": "success",
+            "spaces": spaces,
+            "space_count": len(spaces)
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Confluence spaces error: {str(e)}")
+        return jsonify({
+            "status": "failure",
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/confluence/pages", methods=["GET"])
+@require_solari_key
+def confluence_get_space_pages():
+    """
+    Get pages from a specific Confluence space.
+    
+    Query Parameters:
+        user_id (required): Firebase user ID
+        space_id (required): Confluence space ID
+    
+    Usage:
+        GET /api/confluence/pages?user_id=test_user_123&space_id=123456
+    
+    Response:
+        {
+            "status": "success",
+            "pages": [...],
+            "page_count": int
+        }
+    """
+    user_id = request.args.get("user_id")
+    space_id = request.args.get("space_id")
+    
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    
+    if not space_id:
+        return jsonify({"status": "failure", "error": "space_id is required"}), 400
+    
+    try:
+        # Get credentials from Firestore (same as Jira - uses Atlassian OAuth)
+        creds = _get_jira_creds(user_id)
+        access_token = creds["access_token"]
+        cloud_id = creds["cloud_id"]
+        
+        # Build Confluence API v2 URL for pages in a specific space
+        url = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/spaces/{space_id}/pages"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch Confluence pages: {response.text}")
+            return jsonify({
+                "status": "failure",
+                "error": f"Failed to fetch Confluence pages: {response.text}"
+            }), 400
+        
+        data = response.json()
+        
+        # Return pages
+        pages = data.get("results", [])
+        return jsonify({
+            "status": "success",
+            "pages": pages,
+            "page_count": len(pages)
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Confluence pages error: {str(e)}")
+        return jsonify({
+            "status": "failure",
+            "error": str(e)
+        }), 500
+
+@app.route("/api/confluence/page", methods=["GET"])
+@require_solari_key
+def confluence_get_page():
+    """
+    Get a specific Confluence page by page ID.
+    
+    Query Parameters:
+        user_id (required): Firebase user ID
+        page_id (required): Confluence page ID
+    
+    Usage:
+        GET /api/confluence/page?user_id=test_user_123&page_id=123456
+    
+    Response:
+        {
+            "status": "success",
+            "page": {...}
+        }
+    """
+    user_id = request.args.get("user_id")
+    page_id = request.args.get("page_id")
+    
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    
+    if not page_id:
+        return jsonify({"status": "failure", "error": "page_id is required"}), 400
+    
+    try:
+        # Get credentials from Firestore (same as Jira - uses Atlassian OAuth)
+        creds = _get_jira_creds(user_id)
+        access_token = creds["access_token"]
+        cloud_id = creds["cloud_id"]
+        
+        # Build Confluence API v2 URL for a specific page
+        url = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/pages/{page_id}"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch Confluence page: {response.text}")
+            return jsonify({
+                "status": "failure",
+                "error": f"Failed to fetch Confluence page: {response.text}"
+            }), 400
+        
+        page_data = response.json()
+        
+        return jsonify({
+            "status": "success",
+            "page": page_data
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Confluence page error: {str(e)}")
+        return jsonify({
+            "status": "failure",
+            "error": str(e)
+        }), 500
+
+@app.route("/api/confluence/search", methods=["GET"])
+@require_solari_key
+def confluence_search_pages():
+    """
+    Search Confluence pages using CQL (Confluence Query Language).
+    
+    Query Parameters:
+        user_id (required): Firebase user ID
+        query (required): CQL query string (e.g., "type=page AND title~\"meeting\"")
+        limit (optional): Maximum number of results (default: 10)
+    
+    Usage:
+        GET /api/confluence/search?user_id=test_user_123&query=type=page%20AND%20title~%22meeting%22
+        GET /api/confluence/search?user_id=test_user_123&query=type=page%20AND%20title~%22meeting%22&limit=20
+    
+    Response:
+        {
+            "status": "success",
+            "results": [...],
+            "result_count": int
+        }
+    """
+    user_id = request.args.get("user_id")
+    query = request.args.get("query")
+    limit = request.args.get("limit", "10")
+    
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    
+    if not query:
+        return jsonify({"status": "failure", "error": "query is required"}), 400
+    
+    try:
+        # Get credentials from Firestore (same as Jira - uses Atlassian OAuth)
+        creds = _get_jira_creds(user_id)
+        access_token = creds["access_token"]
+        cloud_id = creds["cloud_id"]
+        
+        # Build Confluence REST API search URL
+        url = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/rest/api/search"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        
+        params = {
+            "cql": query,
+            "limit": limit
+        }
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to search Confluence pages: {response.text}")
+            return jsonify({
+                "status": "failure",
+                "error": f"Failed to search Confluence pages: {response.text}"
+            }), 400
+        
+        data = response.json()
+        
+        # Extract results from the response
+        results = data.get("results", [])
+        return jsonify({
+            "status": "success",
+            "results": results,
+            "result_count": len(results)
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Confluence search error: {str(e)}")
+        return jsonify({
+            "status": "failure",
+            "error": str(e)
+        }), 500
+
+@app.route("/api/confluence/get-page", methods=["GET"])
+@require_solari_key
+def confluence_get_full_page():
+    """
+    Get a specific Confluence page by page ID.
+    
+    Query Parameters:
+        user_id (required): Firebase user ID
+        page_id (required): Confluence page ID
+        body_format (optional): Format for page body (e.g., "storage", "atlas_doc_format", "wiki"). Default: None
+    
+    Usage:
+        GET /api/confluence/page?user_id=test_user_123&page_id=123456
+        GET /api/confluence/page?user_id=test_user_123&page_id=123456&body_format=storage
+    
+    Response:
+        {
+            "status": "success",
+            "page": {...}
+        }
+    """
+    user_id = request.args.get("user_id")
+    page_id = request.args.get("page_id")
+    body_format = request.args.get("body_format")
+    
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    
+    if not page_id:
+        return jsonify({"status": "failure", "error": "page_id is required"}), 400
+    
+    try:
+        # Get credentials from Firestore (same as Jira - uses Atlassian OAuth)
+        creds = _get_jira_creds(user_id)
+        access_token = creds["access_token"]
+        cloud_id = creds["cloud_id"]
+        
+        # Build Confluence API v2 URL for a specific page
+        url = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/pages/{page_id}"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        
+        # Add body_format as query parameter if provided
+        params = {}
+        if body_format:
+            params["body_format"] = body_format
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch Confluence page: {response.text}")
+            return jsonify({
+                "status": "failure",
+                "error": f"Failed to fetch Confluence page: {response.text}"
+            }), 400
+        
+        page_data = response.json()
+        
+        return jsonify({
+            "status": "success",
+            "page": page_data
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Confluence page error: {str(e)}")
+        return jsonify({
+            "status": "failure",
+            "error": str(e)
+        }), 500
 
 if __name__ == '__main__':
     # Get port from environment or default to 5000
