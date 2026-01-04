@@ -4494,6 +4494,16 @@ def confluence_get_full_page():
             "error": str(e)
         }), 500
 
+
+# SLACK INTEGRATION WORK 
+@app.get("/slack/oauth/callback")
+def slack_oauth_debug():
+    print("=== Slack OAuth Callback ===")
+    print("Query params:", dict(request.args))
+    print("===========================")
+
+    return "Slack OAuth callback received. Check server logs."
+
 if __name__ == '__main__':
     # Get port from environment or default to 5000
     port = int(get_env_var('PORT', default='5000'))
