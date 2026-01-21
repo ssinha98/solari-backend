@@ -28,6 +28,8 @@ from functools import wraps
 from urllib.parse import urlencode
 import requests
 import secrets
+import uuid
+from zoneinfo import ZoneInfo
 
 # from typing import List
 # Load environment variables from .env file
@@ -55,6 +57,7 @@ CORS(app,
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # Initialize Firecrawl with error handling
 firecrawl_api_key = os.getenv('FIRECRAWL_API_KEY')
@@ -171,6 +174,34 @@ def add_cors_headers(response):
     response.headers['Access-Control-Max-Age'] = '86400'
     return response
 
+def send_email(to_email, subject, body, html_body=None):
+    """Sends an email using Mailgun API"""
+    mailgun_api_key = os.getenv('MAILGUN_API_KEY')
+    if not mailgun_api_key:
+        logger.error("Mailgun API key not found in environment variables")
+        return None
+
+    payload = {
+        "from": "Solari Robots <postmaster@robots.yourca.io>",
+        "to": to_email,
+        "subject": subject,
+        "text": body,
+    }
+    if html_body:
+        payload["html"] = html_body
+
+    try:
+        response = requests.post(
+            "https://api.mailgun.net/v3/robots.yourca.io/messages",
+            auth=("api", mailgun_api_key),
+            data=payload,
+            timeout=10
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Error sending email: {str(e)}")
+        return None
+
 # Global Response Handler
 @app.after_request
 def after_request(response):
@@ -284,6 +315,9 @@ def test_firebase_connection():
         }
     
     return results
+
+# set up firebase client
+db = firestore.client()
 
 # Initialize Pinecone client
 def get_pinecone_client():
@@ -1147,6 +1181,361 @@ def example_endpoint():
             'received_data': data
         }), 201
 
+@app.route('/api/team/invite_members', methods=['POST', 'OPTIONS'])
+@require_solari_key
+def invite_team_members():
+    if request.method == "OPTIONS":
+        return add_cors_headers(make_response()), 204
+
+    try:
+        data = request.get_json() or {}
+        emails = data.get('emails')
+        user_id = data.get('userId')
+        team_id = data.get('teamId')
+
+        if not emails or not isinstance(emails, list) or not user_id or not team_id:
+            return jsonify({
+                'success': False,
+                'error': 'Missing required parameters: emails, userId, and teamId'
+            }), 400
+        creator_first_name, _, error = _get_team_creator_first_name(team_id, user_id)
+        if error:
+            return jsonify({"success": False, "error": error["message"]}), error["status"]
+
+        db = firestore.client()
+        team_snap = db.collection("teams").document(team_id).get()
+        if not team_snap.exists:
+            return jsonify({"success": False, "error": "team_not_found"}), 404
+        team_data = team_snap.to_dict() or {}
+        team_name = (team_data.get("team_name") or "").strip()
+        invite_code = (team_data.get("invite_code") or "").strip()
+        if not team_name or not invite_code:
+            return jsonify({
+                "success": False,
+                "error": "team_name_or_invite_code_missing"
+            }), 500
+
+        inviter_snap = db.collection("users").document(str(user_id)).get()
+        if not inviter_snap.exists:
+            return jsonify({"success": False, "error": "inviter_not_found"}), 404
+        inviter_data = inviter_snap.to_dict() or {}
+        inviter_name = (inviter_data.get("displayName") or "").strip()
+        if not inviter_name:
+            return jsonify({"success": False, "error": "inviter_display_name_missing"}), 500
+
+        subject = f"{creator_first_name} invited you to the {team_name} workspace"
+        login_url = f"http://localhost:3000/login?invite={invite_code}"
+        text_body = (
+            f"Hey there! {inviter_name} has invited you to the {team_name} solari workspace!\n\n"
+            "Join the team by logging in here, and using the invite code below to join your team.\n\n"
+            f"{team_name}'s invite code: {invite_code}."
+        )
+        html_body = (
+            f"Hey there! {inviter_name} has invited you to the {team_name} solari workspace!<br><br>"
+            f'Join the team by logging in <a href="{login_url}">here</a>, '
+            "and using the invite code below to join your team.<br><br>"
+            f"{team_name}'s invite code: {invite_code}."
+        )
+
+        bounced_emails = []
+        for email in emails:
+            response = send_email(email, subject, text_body, html_body=html_body)
+            if not response or response.status_code != 200:
+                bounced_emails.append(email)
+
+        if bounced_emails:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to send one or more invitations',
+                'bounced_emails': bounced_emails
+            }), 500
+
+        return jsonify({'status': 'ok'}), 200
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/agent/add_members', methods=['POST', 'OPTIONS'])
+@require_solari_key
+def add_agent_members():
+    if request.method == "OPTIONS":
+        return add_cors_headers(make_response()), 204
+
+    try:
+        data = request.get_json() or {}
+        team_id = data.get("team_id") or data.get("teamId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        agent_name = data.get("agent_name") or data.get("agentName")
+        members = data.get("members")
+
+        if not team_id or not agent_id or not agent_name or not isinstance(members, list) or not members:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: team_id, agent_id, agent_name, members"
+            }), 400
+
+        db = firestore.client()
+        team_users_ref = db.collection("teams").document(team_id).collection("users")
+        members_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("agent-members")
+        )
+
+        successes = []
+        failures = []
+
+        for member in members:
+            email_raw = (member or {}).get("email")
+            permission_raw = (member or {}).get("permission")
+            if not email_raw or not permission_raw:
+                failures.append({
+                    "email": email_raw or "",
+                    "error": "missing_email_or_permission"
+                })
+                continue
+
+            permission = str(permission_raw).strip().lower()
+            if permission not in ("view", "edit", "admin"):
+                failures.append({
+                    "email": email_raw,
+                    "error": "invalid_permission"
+                })
+                continue
+
+            email = str(email_raw).strip()
+            if not email:
+                failures.append({
+                    "email": email_raw or "",
+                    "error": "invalid_email"
+                })
+                continue
+
+            try:
+                # Find team user by email (expecting one match)
+                user_docs = list(team_users_ref.where("email", "==", email).limit(1).stream())
+                if not user_docs and email.lower() != email:
+                    user_docs = list(team_users_ref.where("email", "==", email.lower()).limit(1).stream())
+
+                if not user_docs:
+                    failures.append({
+                        "email": email,
+                        "error": "user_not_found_in_team"
+                    })
+                    continue
+
+                user_doc = user_docs[0]
+                user_id = user_doc.id
+                user_data = user_doc.to_dict() or {}
+                user_email = user_data.get("email") or email
+                display_name = user_data.get("displayName") or ""
+                photo_url = user_data.get("photoURL") or ""
+
+                team_user_ref = team_users_ref.document(user_id)
+                member_doc_ref = members_ref.document(user_id)
+
+                @firestore.transactional
+                def update_member(txn: firestore.Transaction):
+                    team_user_snap = team_user_ref.get(transaction=txn)
+                    if not team_user_snap.exists:
+                        return {"ok": False, "error": "team_user_not_found"}
+
+                    team_user_data = team_user_snap.to_dict() or {}
+                    existing_agents = team_user_data.get("agents") or []
+                    if not isinstance(existing_agents, list):
+                        existing_agents = []
+
+                    updated_agents = []
+                    agent_entry_found = False
+                    existing_agent_permission = None
+                    for entry in existing_agents:
+                        if isinstance(entry, dict) and entry.get("agent_id") == agent_id:
+                            agent_entry_found = True
+                            existing_agent_permission = entry.get("permission")
+                            updated_entry = dict(entry)
+                            if permission != existing_agent_permission:
+                                updated_entry["permission"] = permission
+                            updated_entry["agent_name"] = agent_name
+                            updated_agents.append(updated_entry)
+                        else:
+                            updated_agents.append(entry)
+
+                    if not agent_entry_found:
+                        updated_agents.append({
+                            "agent_id": agent_id,
+                            "role": permission,
+                            "agent_name": agent_name
+                        })
+
+                    member_snap = member_doc_ref.get(transaction=txn)
+                    member_existing = member_snap.to_dict() if member_snap.exists else {}
+                    member_existing_permission = member_existing.get("permission")
+
+                    txn.update(team_user_ref, {"agents": updated_agents})
+                    txn.set(member_doc_ref, {
+                        "uid": user_id,
+                        "email": user_email,
+                        "role": permission,
+                        "displayName": display_name,
+                        "photoURL": photo_url
+                    }, merge=True)
+
+                    no_agent_change = agent_entry_found and existing_agent_permission == permission
+                    no_member_change = member_snap.exists and member_existing_permission == permission
+
+                    return {
+                        "ok": True,
+                        "already_added": no_agent_change and no_member_change
+                    }
+
+                txn = db.transaction()
+                result = update_member(txn)
+                if not result.get("ok"):
+                    failures.append({
+                        "email": email,
+                        "error": result.get("error") or "update_failed"
+                    })
+                    continue
+
+                if result.get("already_added"):
+                    successes.append({
+                        "email": user_email,
+                        "uid": user_id,
+                        "role": permission,
+                        "message": "member was already added to team"
+                    })
+                else:
+                    successes.append({
+                        "email": user_email,
+                        "uid": user_id,
+                        "role": permission,
+                        "message": "member added"
+                    })
+
+            except Exception as e:
+                logger.error(f"Error adding member {email}: {str(e)}", exc_info=True)
+                failures.append({
+                    "email": email,
+                    "error": str(e)
+                })
+
+        return jsonify({
+            "success": True,
+            "added": successes,
+            "failures": failures
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in add_agent_members: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/agent/remove_members', methods=['POST', 'OPTIONS'])
+@require_solari_key
+def remove_agent_member():
+    if request.method == "OPTIONS":
+        return add_cors_headers(make_response()), 204
+
+    try:
+        data = request.get_json() or {}
+        team_id = data.get("team_id") or data.get("teamId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        user_id = data.get("user_id") or data.get("userId")
+
+        if not team_id or not agent_id or not user_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: team_id, agent_id, user_id"
+            }), 400
+
+        db = firestore.client()
+        team_user_ref = db.collection("teams").document(team_id).collection("users").document(user_id)
+        member_doc_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("agent-members").document(user_id)
+        )
+
+        @firestore.transactional
+        def remove_member(txn: firestore.Transaction):
+            team_user_snap = team_user_ref.get(transaction=txn)
+            if not team_user_snap.exists:
+                return {"ok": False, "error": "team_user_not_found"}
+
+            team_user_data = team_user_snap.to_dict() or {}
+            existing_agents = team_user_data.get("agents") or []
+            if not isinstance(existing_agents, list):
+                existing_agents = []
+
+            updated_agents = []
+            for entry in existing_agents:
+                if isinstance(entry, dict):
+                    entry_agent_id = entry.get("agent_id") or entry.get("agentId")
+                    if entry_agent_id == agent_id:
+                        continue
+                elif isinstance(entry, str):
+                    if entry == agent_id:
+                        continue
+                updated_agents.append(entry)
+
+            txn.update(team_user_ref, {"agents": updated_agents})
+            txn.delete(member_doc_ref)
+
+            return {"ok": True}
+
+        txn = db.transaction()
+        result = remove_member(txn)
+        if not result.get("ok"):
+            return jsonify({
+                "success": False,
+                "error": result.get("error") or "remove_failed"
+            }), 400
+
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        logger.error(f"Error in remove_agent_member: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/agent/list_members', methods=['POST', 'OPTIONS'])
+@require_solari_key
+def list_agent_members():
+    if request.method == "OPTIONS":
+        return add_cors_headers(make_response()), 204
+
+    try:
+        data = request.get_json() or {}
+        team_id = data.get("team_id") or data.get("teamId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not team_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: team_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        members_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("agent-members")
+        )
+
+        members = []
+        for doc in members_ref.stream():
+            payload = doc.to_dict() or {}
+            payload["id"] = doc.id
+            members.append(payload)
+
+        return jsonify({
+            "success": True,
+            "members": members
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in list_agent_members: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/pinecone_doc_upload', methods=['POST'])
 @require_solari_key
 def pinecone_doc_upload():
@@ -1546,12 +1935,13 @@ def analyze_tabular_data(file_content: bytes, file_path: str) -> dict:
         logger.error(f"Error analyzing tabular data: {str(e)}")
         raise ValueError(f"Failed to analyze tabular data: {str(e)}")
 
-def download_table_from_source(user_id: str, agent_id: str, document_id: str) -> dict:
+def download_table_from_source(team_id: str, user_id: str, agent_id: str, document_id: str) -> dict:
     """
     Download a table file (CSV, Excel, etc.) from Firebase Storage using a Firestore source document
     and return both the file content and metadata.
     
     Args:
+        team_id: Team identifier
         user_id: User identifier
         agent_id: Agent identifier
         document_id: Source document identifier
@@ -1568,11 +1958,15 @@ def download_table_from_source(user_id: str, agent_id: str, document_id: str) ->
         ValueError: If document not found, filePath missing, or download/analysis fails
     """
     try:
-        logger.info(f"Downloading table for user: {user_id}, agent: {agent_id}, document: {document_id}")
+        logger.info(f"Downloading table for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
         
         # Step 1: Get document from Firestore
         db = firestore.client()
-        doc_ref = db.collection('users').document(user_id).collection('agents').document(agent_id).collection('sources').document(document_id)
+        doc_ref = (
+            db.collection('teams').document(team_id)
+              .collection('agents').document(agent_id)
+              .collection('sources').document(document_id)
+        )
         doc = doc_ref.get()
         
         if not doc.exists:
@@ -1698,13 +2092,14 @@ def analyze_table():
     
     Expected request body:
     {
+        "team_id": "team123",
         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
         "agent_id": "agent123",
         "document_id": "miRtr9IDqCzu66rBksTG"
     }
     
     Process:
-    1. Get document from Firestore at users/{user_id}/agents/{agent_id}/sources/{document_id}
+    1. Get document from Firestore at teams/{team_id}/agents/{agent_id}/sources/{document_id}
     2. Extract filePath from document
     3. Download file from Firebase Storage
     4. Analyze file to get row count and column types
@@ -1724,6 +2119,13 @@ def analyze_table():
             }), 400
         
         # Validate required fields
+        team_id = data.get('team_id') or data.get('teamId')
+        if not team_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'team_id parameter is required'
+            }), 400
+
         user_id = data.get('user_id')
         if not user_id:
             return jsonify({
@@ -1745,11 +2147,15 @@ def analyze_table():
                 'message': 'document_id parameter is required'
             }), 400
         
-        logger.info(f"Analyzing table for user: {user_id}, agent: {agent_id}, document: {document_id}")
+        logger.info(f"Analyzing table for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
         
         # Step 1: Get document from Firestore
         db = firestore.client()
-        doc_ref = db.collection('users').document(user_id).collection('agents').document(agent_id).collection('sources').document(document_id)
+        doc_ref = (
+            db.collection('teams').document(team_id)
+              .collection('agents').document(agent_id)
+              .collection('sources').document(document_id)
+        )
         doc = doc_ref.get()
         
         if not doc.exists:
@@ -1819,6 +2225,7 @@ def download_table():
     
     Expected request body:
     {
+        "team_id": "team123",
         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
         "agent_id": "agent123",
         "document_id": "MV9pGL1YP6iLdCeBxKay"
@@ -1839,6 +2246,13 @@ def download_table():
             }), 400
         
         # Validate required fields
+        team_id = data.get('team_id') or data.get('teamId')
+        if not team_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'team_id parameter is required'
+            }), 400
+
         user_id = data.get('user_id')
         if not user_id:
             return jsonify({
@@ -1860,10 +2274,10 @@ def download_table():
                 'message': 'document_id parameter is required'
             }), 400
         
-        logger.info(f"Testing download_table_from_source for user: {user_id}, agent: {agent_id}, document: {document_id}")
+        logger.info(f"Testing download_table_from_source for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
         
         # Call the function
-        result = download_table_from_source(user_id, agent_id, document_id)
+        result = download_table_from_source(team_id, user_id, agent_id, document_id)
         
         # Prepare response (exclude file_content bytes, but include file size)
         response_data = {
@@ -1902,6 +2316,7 @@ def prepare_table():
     
     Expected request body:
     {
+        "team_id": "team123",
         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
         "agent_id": "agent123",
         "document_id": "MV9pGL1YP6iLdCeBxKay"
@@ -1927,6 +2342,13 @@ def prepare_table():
             }), 400
         
         # Validate required fields
+        team_id = data.get('team_id') or data.get('teamId')
+        if not team_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'team_id parameter is required'
+            }), 400
+
         user_id = data.get('user_id')
         if not user_id:
             return jsonify({
@@ -1948,11 +2370,11 @@ def prepare_table():
                 'message': 'document_id parameter is required'
             }), 400
         
-        logger.info(f"Preparing table for DuckDB: user: {user_id}, agent: {agent_id}, document: {document_id}")
+        logger.info(f"Preparing table for DuckDB: team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
         
         # Step 1: Download file and get metadata
         logger.info("Step 1: Downloading table and extracting metadata...")
-        download_result = download_table_from_source(user_id, agent_id, document_id)
+        download_result = download_table_from_source(team_id, user_id, agent_id, document_id)
         
         # Step 2: Save file to temp directory
         logger.info("Step 2: Saving file to temp directory...")
@@ -2001,6 +2423,7 @@ def query_table():
     
     Expected request body:
     {
+        "team_id": "team123",
         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
         "agent_id": "agent123",
         "document_id": "MV9pGL1YP6iLdCeBxKay",
@@ -2027,6 +2450,13 @@ def query_table():
             }), 400
         
         # Validate required fields
+        team_id = data.get('team_id') or data.get('teamId')
+        if not team_id:
+            return jsonify({
+                'success': False,
+                'error': 'team_id parameter is required'
+            }), 400
+
         user_id = data.get('user_id')
         if not user_id:
             return jsonify({
@@ -2053,11 +2483,11 @@ def query_table():
         if not isinstance(limit, int) or limit < 1:
             limit = 25
         
-        logger.info(f"Querying table: user: {user_id}, agent: {agent_id}, document: {document_id}, limit: {limit}")
+        logger.info(f"Querying table: team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}, limit: {limit}")
         
         # Step 1: Download file and get metadata
         logger.info("Step 1: Downloading table and extracting metadata...")
-        download_result = download_table_from_source(user_id, agent_id, document_id)
+        download_result = download_table_from_source(team_id, user_id, agent_id, document_id)
         
         # Step 2: Save file to temp directory (force .csv extension since files are converted to CSV on upload)
         logger.info("Step 2: Saving file to temp directory as CSV...")
@@ -2202,11 +2632,12 @@ If no assumptions, assumptions must be "".
 
     return plan
 
-def get_table_meta(user_id: str, document_id: str, agent_id: str = None) -> Dict[str, Any]:
+def get_table_meta(team_id: str, user_id: str, document_id: str, agent_id: str = None) -> Dict[str, Any]:
     """
     Get table metadata from Firestore source document.
     
     Args:
+        team_id: Team identifier
         user_id: User identifier
         document_id: Source document identifier (file_id)
         agent_id: Agent identifier (optional, defaults to 'default' if not provided)
@@ -2221,7 +2652,11 @@ def get_table_meta(user_id: str, document_id: str, agent_id: str = None) -> Dict
         agent_id = 'default'
         logger.warning(f"agent_id not provided, using 'default'")
     
-    doc_ref = db.collection('users').document(user_id).collection('agents').document(agent_id).collection('sources').document(document_id)
+    doc_ref = (
+        db.collection('teams').document(team_id)
+          .collection('agents').document(agent_id)
+          .collection('sources').document(document_id)
+    )
     doc = doc_ref.get()
     
     if not doc.exists:
@@ -2286,6 +2721,7 @@ def table_plan():
     
     Expected request body:
     {
+      "team_id": "...",
       "user_id": "...",
       "source_id": "...",  # This is the document_id
       "question": "...",
@@ -2304,6 +2740,13 @@ def table_plan():
                 'error': 'Request body is required'
             }), 400
         
+        team_id = body.get("team_id") or body.get("teamId")
+        if not team_id:
+            return jsonify({
+                'success': False,
+                'error': 'team_id is required'
+            }), 400
+
         user_id = body.get("user_id")
         if not user_id:
             return jsonify({
@@ -2328,8 +2771,8 @@ def table_plan():
         agent_id = body.get("agent_id")  # Optional
         
         # Step 1: Get table metadata
-        logger.info(f"Getting table metadata for user: {user_id}, agent_id: {agent_id}, source_id: {source_id}")
-        table_meta = get_table_meta(user_id, source_id, agent_id=agent_id)
+        logger.info(f"Getting table metadata for team: {team_id}, user: {user_id}, agent_id: {agent_id}, source_id: {source_id}")
+        table_meta = get_table_meta(team_id, user_id, source_id, agent_id=agent_id)
         column_metadata = table_meta["columnMetadata"]
         
         if not column_metadata:
@@ -2387,6 +2830,7 @@ def fix_table_plan():
     
     Expected request body:
     {
+      "team_id": "...",
       "user_id": "...",
       "source_id": "...",  # This is the document_id
       "plan": {...},
@@ -2405,6 +2849,13 @@ def fix_table_plan():
                 'error': 'Request body is required'
             }), 400
         
+        team_id = body.get("team_id") or body.get("teamId")
+        if not team_id:
+            return jsonify({
+                'success': False,
+                'error': 'team_id is required'
+            }), 400
+
         user_id = body.get("user_id")
         if not user_id:
             return jsonify({
@@ -2429,8 +2880,8 @@ def fix_table_plan():
         agent_id = body.get("agent_id")  # Optional
         
         # Step 1: Get table metadata
-        logger.info(f"Getting table metadata for user: {user_id}, agent_id: {agent_id}, source_id: {source_id}")
-        table_meta = get_table_meta(user_id, source_id, agent_id=agent_id)
+        logger.info(f"Getting table metadata for team: {team_id}, user: {user_id}, agent_id: {agent_id}, source_id: {source_id}")
+        table_meta = get_table_meta(team_id, user_id, source_id, agent_id=agent_id)
         column_metadata = table_meta["columnMetadata"]
         
         if not column_metadata:
@@ -2671,6 +3122,7 @@ def sanity_check_plan(plan: Dict[str, Any], col_types: Dict[str, str]) -> Tuple[
 # --------------------------
 
 def step8_sanity_check(
+    team_id: str,
     user_id: str,
     document_id: str,
     agent_id: str,
@@ -2679,14 +3131,14 @@ def step8_sanity_check(
 ) -> Dict[str, Any]:
     """
     get_table_meta_fn should be your function:
-      get_table_meta(user_id, document_id, agent_id) -> dict (table_meta)
+      get_table_meta(team_id, user_id, document_id, agent_id) -> dict (table_meta)
 
     llm_output is what you pasted:
       {"plan": {...}, "planner_schema": [...], ...}
 
     Returns a dict with ok/issues and debug info.
     """
-    table_meta = get_table_meta_fn(user_id, document_id, agent_id)
+    table_meta = get_table_meta_fn(team_id, user_id, document_id, agent_id)
 
     # Prefer schema from Firestore (source of truth), not from llm_output
     planner_schema = build_planner_schema_from_table_meta(table_meta, max_examples=3)
@@ -2938,13 +3390,13 @@ def _filter_allowed_plan_keys(raw_plan: dict) -> dict:
     raw_plan = raw_plan or {}
     return {k: raw_plan[k] for k in raw_plan if k in ALLOWED_KEYS}
 
-def download_table_csv_to_temp(user_id: str, source_id: str, agent_id: str) -> str:
+def download_table_csv_to_temp(team_id: str, user_id: str, source_id: str, agent_id: str) -> str:
     """
     Download table file and save to temp directory as CSV.
     Returns the local file path.
     Reuses download_table_from_source and materialize_table_file_atomic.
     """
-    download_result = download_table_from_source(user_id, agent_id, source_id)
+    download_result = download_table_from_source(team_id, user_id, agent_id, source_id)
     
     # Ensure CSV extension
     csv_file_path = download_result['file_path']
@@ -3112,20 +3564,21 @@ def execute_plan_endpoint():
     t0 = time.time()
     body = request.get_json(force=True) or {}
 
+    team_id = body.get("team_id") or body.get("teamId")
     user_id = body.get("user_id")
     source_id = body.get("source_id")   # Firestore doc id for the table
     agent_id = body.get("agent_id")
     raw_plan = body.get("plan")
 
-    if not user_id or not source_id or not agent_id or not isinstance(raw_plan, dict):
+    if not team_id or not user_id or not source_id or not agent_id or not isinstance(raw_plan, dict):
         return jsonify({
             "success": False,
-            "error": "Required: user_id, source_id, agent_id, plan (object)"
+            "error": "Required: team_id, user_id, source_id, agent_id, plan (object)"
         }), 400
 
     try:
         # 1) Read schema/meta from Firestore
-        table_meta = get_table_meta(user_id, source_id, agent_id)
+        table_meta = get_table_meta(team_id, user_id, source_id, agent_id)
         planner_schema = build_planner_schema_from_table_meta(table_meta, max_examples=3)
         col_types = col_types_from_planner_schema(planner_schema)
 
@@ -3143,7 +3596,7 @@ def execute_plan_endpoint():
         final_plan = vf["final_plan"]
 
         # 3) Download CSV to temp + run DuckDB
-        local_csv_path = download_table_csv_to_temp(user_id, source_id, agent_id)
+        local_csv_path = download_table_csv_to_temp(team_id, user_id, source_id, agent_id)
         out = run_plan_on_csv(local_csv_path, final_plan)
 
         return jsonify({
@@ -3167,7 +3620,15 @@ def execute_plan_endpoint():
             "ms": int((time.time() - t0) * 1000),
         }), 500
 
-def query_table_endpoint_internal(user_id: str, source_id: str, agent_id: str, question: str):
+def query_table_endpoint_internal(
+    team_id: str,
+    user_id: str,
+    source_id: str,
+    agent_id: str,
+    question: str,
+    request_id: str | None = None,
+    suggested_source: str | None = None,
+):
     """
     Internal function to handle table queries (extracted from query_table_endpoint).
     This allows the table query logic to be called from other endpoints.
@@ -3185,7 +3646,7 @@ def query_table_endpoint_internal(user_id: str, source_id: str, agent_id: str, q
     
     try:
         # 1) Read schema/meta from Firestore
-        table_meta = get_table_meta(user_id, source_id, agent_id)
+        table_meta = get_table_meta(team_id, user_id, source_id, agent_id)
         planner_schema = build_planner_schema_from_table_meta(table_meta, max_examples=3)
         col_types = col_types_from_planner_schema(planner_schema)
 
@@ -3208,12 +3669,14 @@ def query_table_endpoint_internal(user_id: str, source_id: str, agent_id: str, q
                 "fixes_applied": vf["fixes_applied"],
                 "issues": vf["issues"],
                 "suggestions": vf["suggestions"],
+                "requestId": request_id,
+                "suggestedSource": suggested_source,
             }), 200
 
         final_plan = vf["final_plan"]
 
         # 4) Download CSV to temp + run DuckDB
-        local_csv_path = download_table_csv_to_temp(user_id, source_id, agent_id)
+        local_csv_path = download_table_csv_to_temp(team_id, user_id, source_id, agent_id)
         out = run_plan_on_csv(local_csv_path, final_plan)
 
         # 5) Generate summarized response using OpenAI
@@ -3272,6 +3735,8 @@ Provide a clear, concise answer to the question based on the table data above.""
             "sql": out["sql"],
             "table": out["table"],
             "response_summarized": response_summarized,
+            "requestId": request_id,
+            "suggestedSource": suggested_source,
         }), 200
 
     except Exception as e:
@@ -3280,6 +3745,8 @@ Provide a clear, concise answer to the question based on the table data above.""
             "success": False,
             "error": str(e),
             "ms": int((time.time() - t0) * 1000),
+            "requestId": request_id,
+            "suggestedSource": suggested_source,
         }), 500
 
 @app.route("/api/table/ask/ai_sql", methods=["POST"])
@@ -3287,18 +3754,19 @@ Provide a clear, concise answer to the question based on the table data above.""
 def query_table_endpoint():
     body = request.get_json(force=True) or {}
 
+    team_id = body.get("team_id") or body.get("teamId")
     user_id = body.get("user_id")
     source_id = body.get("source_id")
     agent_id = body.get("agent_id")
     question = body.get("question")
 
-    if not user_id or not source_id or not agent_id or not question:
+    if not team_id or not user_id or not source_id or not agent_id or not question:
         return jsonify({
             "success": False,
-            "error": "Required: user_id, source_id, agent_id, question"
+            "error": "Required: team_id, user_id, source_id, agent_id, question"
         }), 400
 
-    return query_table_endpoint_internal(user_id, source_id, agent_id, question)
+    return query_table_endpoint_internal(team_id, user_id, source_id, agent_id, question, request_id=body.get("requestId"))
 
 @app.route("/api/table/plan/check", methods=["POST"])
 @require_solari_key
@@ -3308,6 +3776,7 @@ def check_table_plan():
     
     Expected request body:
     {
+      "team_id": "...",
       "user_id": "...",
       "document_id": "...",
       "agent_id": "...",
@@ -3321,14 +3790,15 @@ def check_table_plan():
     body = request.get_json(force=True) or {}
 
     # Required identifiers
+    team_id = body.get("team_id") or body.get("teamId")
     user_id = body.get("user_id")
     document_id = body.get("document_id")
     agent_id = body.get("agent_id")
 
-    if not user_id or not document_id or not agent_id:
+    if not team_id or not user_id or not document_id or not agent_id:
         return jsonify({
             "success": False,
-            "error": "Missing required fields: user_id, document_id, agent_id"
+            "error": "Missing required fields: team_id, user_id, document_id, agent_id"
         }), 400
 
     # Accept either a raw plan or a planner-style llm_output object
@@ -3353,6 +3823,7 @@ def check_table_plan():
 
         # Run your sanity check logic against Firestore metadata
         result = step8_sanity_check(
+            team_id=team_id,
             user_id=user_id,
             document_id=document_id,
             agent_id=agent_id,
@@ -3583,11 +4054,12 @@ def validate_selected_nickname(selected_nickname: str, sources: list) -> str:
     
     return selected_nickname
 
-def decide_source(userid: str, agent_id: str, namespace: str, query: str, source_type: str = ''):
+def decide_source(team_id: str, userid: str, agent_id: str, namespace: str, query: str, source_type: str = ''):
     """
     Decide which source to use when no nickname is provided.
     
     Args:
+        team_id: Team identifier
         userid: User identifier
         agent_id: Agent identifier
         namespace: Pinecone namespace
@@ -3598,11 +4070,15 @@ def decide_source(userid: str, agent_id: str, namespace: str, query: str, source
         dict with 'success', 'nickname' (if successful), and optionally 'error'
     """
     try:
-        logger.info(f"Deciding source for user: {userid}, agent: {agent_id}, namespace: {namespace}, query: {query[:100]}...")
+        logger.info(f"Deciding source for team: {team_id}, user: {userid}, agent: {agent_id}, namespace: {namespace}, query: {query[:100]}...")
         
         # Step 1: Get list of sources from Firestore
         db = firestore.client()
-        sources_ref = db.collection('users').document(userid).collection('agents').document(agent_id).collection('sources')
+        sources_ref = (
+            db.collection('teams').document(team_id)
+              .collection('agents').document(agent_id)
+              .collection('sources')
+        )
         sources_docs = sources_ref.stream()
         
         sources = []
@@ -3682,6 +4158,16 @@ def ask_pinecone():
                 'metadata': None,
                 'error': 'Request body is required'
             }), 400
+
+        request_id = data.get('requestId')
+        suggested_source = data.get('suggestedSource')
+        if not request_id:
+            return jsonify({
+                'success': False,
+                'answer': None,
+                'metadata': None,
+                'error': 'requestId parameter is required'
+            }), 400
         
         # Validate required fields
         userid = data.get('userid')
@@ -3690,7 +4176,9 @@ def ask_pinecone():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'userid parameter is required'
+                'error': 'userid parameter is required',
+                'requestId': request_id,
+                'suggestedSource': suggested_source
             }), 400
         
         namespace = data.get('namespace')
@@ -3708,7 +4196,9 @@ def ask_pinecone():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'query parameter is required'
+                'error': 'query parameter is required',
+                'requestId': request_id,
+                'suggestedSource': suggested_source
             }), 400
         
         # Optional parameters
@@ -3757,6 +4247,9 @@ def source_confirmed():
     
     Expected request body:
     {
+        "requestId": "req-123",
+        "suggestedSource": "optional-suggested-nickname",
+        "team_id": "team123",
         "userid": "user123",
         "agent_id": "agent123",  # required when nickname is provided
         "namespace": "your-namespace",  # optional, required only for RAG queries
@@ -3774,6 +4267,8 @@ def source_confirmed():
     Returns:
         JSON response with RAG answer and metadata, or table query results
     """
+    request_id = None
+    suggested_source = None
     try:
         # Get request data
         data = request.get_json()
@@ -3783,17 +4278,32 @@ def source_confirmed():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'Request body is required'
+                'error': 'Request body is required',
+                'requestId': request_id,
+                'suggestedSource': suggested_source
             }), 400
+
+        request_id = data.get('requestId')
         
         # Validate required fields
+        team_id = data.get('team_id') or data.get('teamId')
+        if not team_id:
+            return jsonify({
+                'success': False,
+                'answer': None,
+                'metadata': None,
+                'error': 'team_id parameter is required',
+                'requestId': request_id
+            }), 400
+
         userid = data.get('userid')
         if not userid:
             return jsonify({
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'userid parameter is required'
+                'error': 'userid parameter is required',
+                'requestId': request_id
             }), 400
         
         query = data.get('query')
@@ -3802,7 +4312,8 @@ def source_confirmed():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'query parameter is required'
+                'error': 'query parameter is required',
+                'requestId': request_id
             }), 400
         
         # Optional parameters
@@ -3817,16 +4328,22 @@ def source_confirmed():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'agent_id parameter is required when nickname is provided'
+                'error': 'agent_id parameter is required when nickname is provided',
+                'requestId': request_id,
+                'suggestedSource': suggested_source
             }), 400
         
-        logger.info(f"Source confirmed for user: {userid}, agent: {agent_id}, namespace: {namespace}, nickname: {nickname}, query: {query[:100]}...")
+        logger.info(f"Source confirmed for team: {team_id}, user: {userid}, agent: {agent_id}, namespace: {namespace}, nickname: {nickname}, query: {query[:100]}...")
         
         # If nickname is provided, check source type and route accordingly
         if nickname and agent_id:
             try:
                 db = firestore.client()
-                sources_ref = db.collection('users').document(userid).collection('agents').document(agent_id).collection('sources')
+                sources_ref = (
+                    db.collection('teams').document(team_id)
+                      .collection('agents').document(agent_id)
+                      .collection('sources')
+                )
                 
                 # Find the source document with matching nickname
                 sources_docs = sources_ref.where('nickname', '==', nickname).stream()
@@ -3860,7 +4377,15 @@ def source_confirmed():
                     if source_type_field == 'table':
                         logger.info(f"Source is a table, routing to /table/ask/ai_sql endpoint...")
                         # Route to table endpoint (namespace not needed for table queries)
-                        return query_table_endpoint_internal(userid, source_id, agent_id, query)
+                        return query_table_endpoint_internal(
+                            team_id,
+                            userid,
+                            source_id,
+                            agent_id,
+                            query,
+                            request_id=request_id,
+                            suggested_source=suggested_source
+                        )
                     else:
                         # Not a table, proceed with RAG query (namespace required)
                         if not namespace:
@@ -3868,16 +4393,22 @@ def source_confirmed():
                                 'success': False,
                                 'answer': None,
                                 'metadata': None,
-                                'error': 'namespace parameter is required for RAG queries'
+                                'error': 'namespace parameter is required for RAG queries',
+                                'requestId': request_id,
+                                'suggestedSource': suggested_source
                             }), 400
                         
                         logger.info(f"Source is not a table, running RAG query...")
                         result = perform_rag_query(userid, namespace, query, nickname, source_type)
                         
                         if result['success']:
+                            result['requestId'] = request_id
+                            result['suggestedSource'] = suggested_source
                             return jsonify(result), 200
                         else:
                             status_code = 400 if 'error' in result else 500
+                            result['requestId'] = request_id
+                            result['suggestedSource'] = suggested_source
                             return jsonify(result), status_code
                 else:
                     logger.warning(f"Source document with nickname '{nickname}' not found for agent '{agent_id}'")
@@ -3887,15 +4418,21 @@ def source_confirmed():
                             'success': False,
                             'answer': None,
                             'metadata': None,
-                            'error': 'namespace parameter is required for RAG queries'
+                            'error': 'namespace parameter is required for RAG queries',
+                            'requestId': request_id,
+                            'suggestedSource': suggested_source
                         }), 400
                     
                     result = perform_rag_query(userid, namespace, query, nickname, source_type)
                     
                     if result['success']:
+                        result['requestId'] = request_id
+                        result['suggestedSource'] = suggested_source
                         return jsonify(result), 200
                     else:
                         status_code = 400 if 'error' in result else 500
+                        result['requestId'] = request_id
+                        result['suggestedSource'] = suggested_source
                         return jsonify(result), status_code
             except Exception as e:
                 logger.error(f"Error updating source document or checking type: {str(e)}", exc_info=True)
@@ -3905,15 +4442,21 @@ def source_confirmed():
                         'success': False,
                         'answer': None,
                         'metadata': None,
-                        'error': 'namespace parameter is required for RAG queries'
+                        'error': 'namespace parameter is required for RAG queries',
+                        'requestId': request_id,
+                        'suggestedSource': suggested_source
                     }), 400
                 
                 result = perform_rag_query(userid, namespace, query, nickname, source_type)
                 
                 if result['success']:
+                    result['requestId'] = request_id
+                    result['suggestedSource'] = suggested_source
                     return jsonify(result), 200
                 else:
                     status_code = 400 if 'error' in result else 500
+                    result['requestId'] = request_id
+                    result['suggestedSource'] = suggested_source
                     return jsonify(result), status_code
         else:
             # No nickname provided, just run RAG query without filtering (namespace required)
@@ -3922,15 +4465,21 @@ def source_confirmed():
                     'success': False,
                     'answer': None,
                     'metadata': None,
-                    'error': 'namespace parameter is required for RAG queries'
+                    'error': 'namespace parameter is required for RAG queries',
+                    'requestId': request_id,
+                    'suggestedSource': suggested_source
                 }), 400
             
             result = perform_rag_query(userid, namespace, query, '', source_type)
             
             if result['success']:
+                result['requestId'] = request_id
+                result['suggestedSource'] = suggested_source
                 return jsonify(result), 200
             else:
                 status_code = 400 if 'error' in result else 500
+                result['requestId'] = request_id
+                result['suggestedSource'] = suggested_source
                 return jsonify(result), status_code
         
     except BadRequest as e:
@@ -3939,7 +4488,9 @@ def source_confirmed():
             'success': False,
             'answer': None,
             'metadata': None,
-            'error': f'Invalid JSON in request body: {str(e)}'
+            'error': f'Invalid JSON in request body: {str(e)}',
+            'requestId': request_id,
+            'suggestedSource': suggested_source
         }), 400
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
@@ -3947,7 +4498,9 @@ def source_confirmed():
             'success': False,
             'answer': None,
             'metadata': None,
-            'error': str(e)
+            'error': str(e),
+            'requestId': request_id,
+            'suggestedSource': suggested_source
         }), 400
     except Exception as e:
         logger.error(f"Error in source-confirmed: {str(e)}", exc_info=True)
@@ -3955,7 +4508,9 @@ def source_confirmed():
             'success': False,
             'answer': None,
             'metadata': None,
-            'error': f'Failed to process source-confirmed request: {str(e)}'
+            'error': f'Failed to process source-confirmed request: {str(e)}',
+            'requestId': request_id,
+            'suggestedSource': suggested_source
         }), 500
 
 @app.route('/api/handle-rag-message', methods=['POST'])
@@ -3966,6 +4521,8 @@ def handle_rag_message():
     
     Expected request body:
     {
+        "requestId": "req-123",
+        "team_id": "team123",
         "userid": "user123",
         "agent_id": "agent123",
         "namespace": "your-namespace",
@@ -3983,6 +4540,7 @@ def handle_rag_message():
     Returns:
         JSON response with RAG answer and metadata, or table query results
     """
+    request_id = None
     try:
         # Get request data
         data = request.get_json()
@@ -3992,17 +4550,39 @@ def handle_rag_message():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'Request body is required'
+                'error': 'Request body is required',
+                'requestId': request_id
+            }), 400
+
+        request_id = data.get('requestId')
+        if not request_id:
+            return jsonify({
+                'success': False,
+                'answer': None,
+                'metadata': None,
+                'error': 'requestId parameter is required',
+                'requestId': request_id
             }), 400
         
         # Validate required fields
+        team_id = data.get('team_id') or data.get('teamId')
+        if not team_id:
+            return jsonify({
+                'success': False,
+                'answer': None,
+                'metadata': None,
+                'error': 'team_id parameter is required',
+                'requestId': request_id
+            }), 400
+
         userid = data.get('userid')
         if not userid:
             return jsonify({
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'userid parameter is required'
+                'error': 'userid parameter is required',
+                'requestId': request_id
             }), 400
         
         namespace = data.get('namespace')
@@ -4011,7 +4591,8 @@ def handle_rag_message():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'namespace parameter is required'
+                'error': 'namespace parameter is required',
+                'requestId': request_id
             }), 400
         
         query = data.get('query')
@@ -4020,7 +4601,8 @@ def handle_rag_message():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'query parameter is required'
+                'error': 'query parameter is required',
+                'requestId': request_id
             }), 400
         
         agent_id = data.get('agent_id')
@@ -4029,7 +4611,8 @@ def handle_rag_message():
                 'success': False,
                 'answer': None,
                 'metadata': None,
-                'error': 'agent_id parameter is required'
+                'error': 'agent_id parameter is required',
+                'requestId': request_id
             }), 400
         
         # Optional parameters
@@ -4043,7 +4626,11 @@ def handle_rag_message():
             # Look up source document to check type
             try:
                 db = firestore.client()
-                sources_ref = db.collection('users').document(userid).collection('agents').document(agent_id).collection('sources')
+                sources_ref = (
+                    db.collection('teams').document(team_id)
+                      .collection('agents').document(agent_id)
+                      .collection('sources')
+                )
                 
                 # Find the source document with matching nickname
                 sources_docs = sources_ref.where('nickname', '==', nickname).stream()
@@ -4059,7 +4646,8 @@ def handle_rag_message():
                         'success': False,
                         'answer': None,
                         'metadata': None,
-                        'error': f'Source with nickname "{nickname}" not found'
+                        'error': f'Source with nickname "{nickname}" not found',
+                        'requestId': request_id
                     }), 400
                 
                 # Check if source is a table type
@@ -4069,15 +4657,17 @@ def handle_rag_message():
                 if source_type_field == 'table':
                     logger.info(f"Source is a table, routing to /table/ask/ai_sql endpoint...")
                     # Route to table endpoint
-                    return query_table_endpoint_internal(userid, source_id, agent_id, query)
+                    return query_table_endpoint_internal(team_id, userid, source_id, agent_id, query, request_id=request_id)
                 else:
                     # Not a table, proceed with RAG query
                     logger.info(f"Source is not a table, running RAG query...")
                     result = perform_rag_query(userid, namespace, query, nickname, source_type)
                     
                     if result['success']:
+                        result['requestId'] = request_id
                         return jsonify(result), 200
                     else:
+                        result['requestId'] = request_id
                         return jsonify(result), 400
                         
             except Exception as e:
@@ -4086,20 +4676,22 @@ def handle_rag_message():
                     'success': False,
                     'answer': None,
                     'metadata': None,
-                    'error': f'Failed to look up source: {str(e)}'
+                    'error': f'Failed to look up source: {str(e)}',
+                    'requestId': request_id
                 }), 500
         
         # If no nickname, run decide_source function first
         else:
             logger.info("No nickname provided, running decide_source function...")
-            source_decision = decide_source(userid, agent_id, namespace, query, source_type)
+            source_decision = decide_source(team_id, userid, agent_id, namespace, query, source_type)
             
             if not source_decision['success']:
                 return jsonify({
                     'success': False,
                     'answer': None,
                     'metadata': None,
-                    'error': source_decision.get('error', 'Failed to decide source')
+                    'error': source_decision.get('error', 'Failed to decide source'),
+                    'requestId': request_id
                 }), 400
             
             # Extract the selected nickname
@@ -4109,7 +4701,8 @@ def handle_rag_message():
                     'success': False,
                     'answer': None,
                     'metadata': None,
-                    'error': 'No nickname returned from decide_source'
+                    'error': 'No nickname returned from decide_source',
+                    'requestId': request_id
                 }), 400
             
             logger.info(f"Selected nickname from decide_source: {selected_nickname}")
@@ -4118,6 +4711,7 @@ def handle_rag_message():
             return jsonify({
                 'success': True,
                 'chosen_nickname': selected_nickname,
+                'requestId': request_id,
                 'metadata': {
                     'userid': userid,
                     'agent_id': agent_id,
@@ -4136,7 +4730,8 @@ def handle_rag_message():
             'success': False,
             'answer': None,
             'metadata': None,
-            'error': f'Invalid JSON in request body: {str(e)}'
+            'error': f'Invalid JSON in request body: {str(e)}',
+            'requestId': request_id
         }), 400
     except Exception as e:
         logger.error(f"Error handling RAG message: {str(e)}", exc_info=True)
@@ -4144,7 +4739,8 @@ def handle_rag_message():
             'success': False,
             'answer': None,
             'metadata': None,
-            'error': f'Failed to handle RAG message: {str(e)}'
+            'error': f'Failed to handle RAG message: {str(e)}',
+            'requestId': request_id
         }), 500
 
 @app.route("/api/confluence/spaces", methods=["GET"])
@@ -4512,7 +5108,28 @@ SLACK_SCOPES = ",".join([
     "channels:read",
     "commands",
     "groups:history",
+    "groups:read"
 ])
+
+def get_team_id_for_uid(db, uid: str) -> str:
+    user_snap = db.collection("users").document(uid).get()
+    if not user_snap.exists:
+        raise KeyError("user_not_found")
+    team_id = (user_snap.to_dict() or {}).get("teamId")
+    if not team_id:
+        raise KeyError("team_id_not_found")
+    return str(team_id)
+
+def get_team_user_ref(db, uid: str):
+    team_id = get_team_id_for_uid(db, uid)
+    team_user_ref = db.collection("teams").document(team_id).collection("users").document(uid)
+    if not team_user_ref.get().exists:
+        raise KeyError("user_not_found")
+    return team_user_ref, team_id
+
+def get_slack_installations_ref(db, uid: str):
+    team_user_ref, team_id = get_team_user_ref(db, uid)
+    return team_user_ref.collection("slack_installations"), team_id
 
 def build_slack_authorize_url(state: str) -> str:
     return (
@@ -4538,11 +5155,17 @@ def slack_start_auth():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 401
 
+    try:
+        _, team_id = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
     state = secrets.token_urlsafe(24)
     created_at = int(time.time())
 
     db.collection("oauth_states").document(state).set({
         "uid": uid,
+        "team_id": team_id,
         "created_at": created_at,
         "provider": "slack",
     })
@@ -4606,20 +5229,1570 @@ def slack_oauth_callback():
     team = token_resp.get("team") or {}
     team_id = team.get("id")
 
-    db.collection("users").document(uid).collection("slack_installations").document(team_id).set({
-        "team": team,
-        "team_id": team_id,
-        "bot_token": bot_token,   # encrypt later
-        "scope": token_resp.get("scope"),
-        "installed_at": int(time.time()),
-        "provider": "slack",
+    if not team_id:
+        logger.error("Missing team.id in Slack token response")
+        return jsonify({"ok": False, "error": "Invalid token response: missing team ID"}), 400
+
+    # Convert to string (in case it's a number) - Slack IDs are usually strings anyway
+    team_id_str = str(team_id)
+
+    try:
+        installs_ref, _ = get_slack_installations_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    installs_ref.document(team_id_str).set({
+        "slack_team": team,
+        "slack_team_id": team_id_str,
+        "slack_bot_token": bot_token,   # encrypt later
+        "slack_scope": token_resp.get("scope"),
+        "slack_installed_at": int(time.time()),
+        "slack_provider": "slack",
     }, merge=True)
 
     # 4. Redirect user back to frontend settings page
     return redirect(
-        "https://solari-frontend-prod.vercel.app/settings",
+        "https://solari-frontend-prod.vercel.app/settings/slack_callback",
         code=302
     )
+
+@app.get("/api/slack/auth_test")
+def slack_auth_test_endpoint():
+    """
+    Call like:
+      GET /slack/auth_test?uid=FIREBASE_UID
+    Optional:
+      GET /slack/auth_test?uid=FIREBASE_UID&team_id=T12345
+    """
+
+    uid = request.args.get("uid")
+    team_id = request.args.get("team_id")  # optional
+    db = firestore.client()
+    if not uid:
+        return jsonify({"ok": False, "error": "missing_uid"}), 400
+
+    # 1) Load the Slack installation doc
+    try:
+        installs_ref, _ = get_slack_installations_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    install_doc = None
+    if team_id:
+        snap = installs_ref.document(team_id).get()
+        if not snap.exists:
+            return jsonify({"ok": False, "error": "installation_not_found", "team_id": team_id}), 404
+        install_doc = snap
+    else:
+        # If team_id not provided, grab the first installation doc
+        snaps = list(installs_ref.limit(1).stream())
+        if not snaps:
+            return jsonify({"ok": False, "error": "no_slack_installation_found"}), 404
+        install_doc = snaps[0]
+        team_id = install_doc.id
+
+    install_data = install_doc.to_dict() or {}
+    bot_token = install_data.get("slack_bot_token")
+
+    if not bot_token:
+        return jsonify({"ok": False, "error": "bot_token_missing", "team_id": team_id}), 500
+
+    # 2) Call Slack auth.test
+    try:
+        slack_resp = requests.post(
+            "https://slack.com/api/auth.test",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            timeout=30,
+        ).json()
+    except Exception as e:
+        return jsonify({"ok": False, "error": "slack_request_failed", "details": str(e)}), 502
+
+    # 3) Return Slack response + which installation we used
+    return jsonify({
+        "ok": True,
+        "uid": uid,
+        "team_id_used": team_id,
+        "slack_auth_test": slack_resp,
+    })
+
+def slack_get(token: str, method: str, params: dict):
+    r = requests.get(
+        f"https://slack.com/api/{method}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=30,
+    )
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(data)
+    return data
+
+def get_bot_token(db, uid: str, team_id: str | None):
+    installs_ref, _ = get_slack_installations_ref(db, uid)
+
+    if team_id:
+        snap = installs_ref.document(team_id).get()
+        if not snap.exists:
+            raise KeyError(f"installation_not_found:{team_id}")
+        data = snap.to_dict() or {}
+        return data.get("slack_bot_token"), team_id
+
+    snaps = list(installs_ref.limit(1).stream())
+    if not snaps:
+        raise KeyError("no_slack_installation_found")
+    data = snaps[0].to_dict() or {}
+    return data.get("slack_bot_token"), snaps[0].id
+
+@app.get("/api/slack/list_channels")
+def slack_channels():
+    """
+    GET /api/slack/list_channels?uid=FIREBASE_UID
+    Optional: &team_id=T123
+    Returns public + private channels (as visible to the bot token).
+    """
+    uid = request.args.get("uid")
+    team_id = request.args.get("team_id")
+
+    db = firestore.client()
+
+    if not uid:
+        return jsonify({"ok": False, "error": "missing_uid"}), 400
+
+    try:
+        bot_token, team_id_used = get_bot_token(db, uid, team_id)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    if not bot_token:
+        return jsonify({"ok": False, "error": "bot_token_missing"}), 500
+
+    types = "public_channel,private_channel"
+    cursor = None
+    channels = []
+
+    try:
+        while True:
+            params = {"types": types, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+
+            data = slack_get(bot_token, "conversations.list", params)
+            channels.extend(data.get("channels", []))
+
+            cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
+
+    except RuntimeError as e:
+        # e.args[0] is the Slack error dict we raised
+        return jsonify({"ok": False, "error": "slack_api_error", "details": e.args[0]}), 502
+
+    # Return a UI-friendly shape
+    result = []
+    for c in channels:
+        result.append({
+            "id": c["id"],
+            "name": c.get("name"),
+            "is_private": c.get("is_private"),
+            "is_member": c.get("is_member"),  # whether the bot is in the channel
+            "num_members": c.get("num_members"),
+            "topic": (c.get("topic") or {}).get("value"),
+        })
+
+    return jsonify({
+        "ok": True,
+        "uid": uid,
+        "team_id_used": team_id_used,
+        "count": len(result),
+        "channels": result,
+    })
+
+
+SLACK_IGNORED_SUBTYPES = {
+    "channel_join",
+    "channel_leave",
+    "channel_topic",
+    "channel_purpose",
+    "channel_name",
+    "channel_archive",
+    "channel_unarchive",
+    # "bot_message",  # uncomment if you want to hide bot messages too
+}
+
+def is_system_message(m: dict) -> bool:
+    return (m.get("subtype") in SLACK_IGNORED_SUBTYPES)
+
+def slack_ts_to_str(ts: str, tz_name: str = "America/New_York") -> str:
+    # Slack ts: "seconds.microseconds" as string
+    try:
+        sec = float(ts)
+        dt = datetime.fromtimestamp(sec, tz=ZoneInfo(tz_name))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts
+
+def slack_get(bot_token: str, method: str, params: dict) -> dict:
+    resp = requests.get(
+        f"https://slack.com/api/{method}",
+        headers={"Authorization": f"Bearer {bot_token}"},
+        params=params,
+        timeout=30,
+    ).json()
+    if not resp.get("ok"):
+        raise RuntimeError(resp)
+    return resp
+
+def get_bot_token_for_uid(db, uid: str, team_id: str | None = None) -> tuple[str, str]:
+    installs_ref, _ = get_slack_installations_ref(db, uid)
+
+    if team_id:
+        snap = installs_ref.document(team_id).get()
+        if not snap.exists:
+            raise KeyError(f"installation_not_found:{team_id}")
+        data = snap.to_dict() or {}
+        return data.get("slack_bot_token"), team_id
+
+    snaps = list(installs_ref.limit(1).stream())
+    if not snaps:
+        raise KeyError("no_slack_installation_found")
+    data = snaps[0].to_dict() or {}
+    return data.get("slack_bot_token"), snaps[0].id
+
+def slack_message_permalink(team_id: str, channel_id: str, message_ts: str) -> str:
+    # Slack deep link that opens the channel/message in Slack
+    return f"https://slack.com/app_redirect?team={team_id}&channel={channel_id}&message_ts={message_ts}"
+
+# --- endpoint ---
+
+def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, channel_name: str,
+                                      team_id: Optional[str] = None, tz: str = "America/New_York",
+                                      limit: int = 500):
+    """
+    Core sync logic for syncing a Slack channel transcript.
+    Returns a dict with the result (not a Flask response).
+    Catches all exceptions and returns error dicts.
+    """
+    try:
+        if not uid or not agent_id or not channel_id or not channel_name:
+            return {"ok": False, "error": "missing_uid_agent_id_channel_id_or_channel_name"}
+
+        # 0) Load bot token
+        try:
+            bot_token, team_id_used = get_bot_token_for_uid(db, uid, team_id)
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+        if not bot_token:
+            return {"ok": False, "error": "bot_token_missing"}
+
+        try:
+            _, team_id_solari = get_team_user_ref(db, uid)
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+
+        # 1) Source doc (Slack channel saved as a "source")
+        source_ref = (
+            db.collection("teams").document(team_id_solari)
+              .collection("agents").document(agent_id)
+              .collection("sources").document(channel_id)
+        )
+
+        source_snap = source_ref.get()
+        existing = source_snap.to_dict() if source_snap.exists else {}
+
+        last_message_ts = (existing.get("last_message_ts") or "").strip()
+        thread_latest_reply_ts = existing.get("thread_latest_reply_ts") or {}
+
+        # Oldest: prefer last_message_ts; fall back to last_synced_at (per your request)
+        oldest = None
+        if last_message_ts:
+            oldest = last_message_ts
+        else:
+            last_synced_at = existing.get("last_synced_at")
+            if last_synced_at:
+                try:
+                    oldest = str(last_synced_at.timestamp())
+                except Exception:
+                    oldest = None
+
+        sync_run_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") + "_" + uuid.uuid4().hex[:8]
+
+        # 2) Fetch incremental history (paginate)
+        cursor = None
+        history_messages = []
+        while True:
+            params = {"channel": channel_id, "limit": min(200, limit - len(history_messages))}
+            if oldest:
+                params["oldest"] = oldest
+                params["inclusive"] = False
+            if cursor:
+                params["cursor"] = cursor
+
+            data = slack_get(bot_token, "conversations.history", params)
+            history_messages.extend(data.get("messages", []) or [])
+
+            if len(history_messages) >= limit:
+                break
+
+            cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
+
+        # 3) Clean history (system messages, empty text, dedupe by ts)
+        cleaned = []
+        seen_ts = set()
+        for m in history_messages:
+            ts_val = m.get("ts")
+            if not ts_val or ts_val in seen_ts:
+                continue
+            seen_ts.add(ts_val)
+
+            if is_system_message(m):
+                continue
+
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+
+            cleaned.append(m)
+
+        cleaned.sort(key=lambda m: float(m.get("ts", "0")))
+
+        # 4) Identify threads to refresh (Level 2 via latest_reply vs map)
+        threads_to_refresh = []
+        for m in cleaned:
+            ts_val = m.get("ts")
+            thread_ts = m.get("thread_ts")
+            reply_count = int(m.get("reply_count") or 0)
+            latest_reply = (m.get("latest_reply") or "").strip()
+
+            is_root = bool(thread_ts and ts_val and thread_ts == ts_val)
+            if not (is_root and reply_count > 0 and latest_reply):
+                continue
+
+            prev_latest = (thread_latest_reply_ts.get(thread_ts) or "").strip()
+            if (not prev_latest) or (float(latest_reply) > float(prev_latest)):
+                threads_to_refresh.append(thread_ts)
+
+        threads_to_refresh = sorted(set(threads_to_refresh), key=lambda x: float(x))
+
+        # 5) Fetch replies for refreshed threads (attempt incremental via oldest)
+        replies_by_thread_ts = {}
+        for tts in threads_to_refresh:
+            prev_latest = (thread_latest_reply_ts.get(tts) or "").strip()
+            params = {"channel": channel_id, "ts": tts, "limit": 200}
+            if prev_latest:
+                params["oldest"] = prev_latest
+                params["inclusive"] = False
+
+            replies_by_thread_ts[tts] = slack_get(bot_token, "conversations.replies", params)
+
+        # 6) Build transcript + threads.json object (for THIS sync run only)
+        transcript_lines = [f"#channel: #{channel_name}  ({channel_id})", ""]
+        threads_out = []  # list of {thread_ts, messages:[{ts,user,text,permalink,is_reply}]}
+
+        max_ts_seen = float(last_message_ts) if last_message_ts else 0.0
+        thread_latest_updates = {}
+
+        for m in cleaned:
+            ts_val = m.get("ts")
+            if ts_val:
+                max_ts_seen = max(max_ts_seen, float(ts_val))
+
+            user = m.get("user") or "unknown"
+            text = (m.get("text") or "").strip()
+
+            thread_ts = m.get("thread_ts")
+            reply_count = int(m.get("reply_count") or 0)
+            latest_reply = (m.get("latest_reply") or "").strip()
+            is_thread_root = bool(thread_ts and ts_val and thread_ts == ts_val and reply_count > 0)
+
+            if is_thread_root:
+                # root always included
+                root_msg_obj = {
+                    "ts": ts_val,
+                    "user": user,
+                    "text": text,
+                    "is_reply": False,
+                    "permalink": slack_message_permalink(team_id_used, channel_id, ts_val),
+                }
+                thread_msgs = [root_msg_obj]
+
+                transcript_lines.append(f"[{slack_ts_to_str(ts_val, tz)}] @{user}: {text}")
+
+                # track latest reply for metadata
+                if latest_reply:
+                    prev = (thread_latest_reply_ts.get(thread_ts) or "").strip()
+                    if (not prev) or (float(latest_reply) > float(prev)):
+                        thread_latest_updates[thread_ts] = latest_reply
+
+                # add replies if fetched this run
+                repl_payload = replies_by_thread_ts.get(thread_ts)
+                if repl_payload and repl_payload.get("ok"):
+                    repl_msgs = repl_payload.get("messages", []) or []
+                    repl_msgs = [x for x in repl_msgs if not is_system_message(x) and (x.get("text") or "").strip()]
+                    repl_msgs.sort(key=lambda x: float(x.get("ts", "0")))
+
+                    for r in repl_msgs:
+                        r_ts = r.get("ts")
+                        if not r_ts:
+                            continue
+                        if r_ts == thread_ts:
+                            continue  # root already included
+
+                        max_ts_seen = max(max_ts_seen, float(r_ts))
+                        r_user = r.get("user") or "unknown"
+                        r_text = (r.get("text") or "").strip()
+
+                        thread_msgs.append({
+                            "ts": r_ts,
+                            "user": r_user,
+                            "text": r_text,
+                            "is_reply": True,
+                            "permalink": slack_message_permalink(team_id_used, channel_id, r_ts),
+                        })
+
+                        transcript_lines.append(
+                            f"  ↳ [{slack_ts_to_str(r_ts, tz)}] @{r_user}: {r_text}"
+                        )
+
+                transcript_lines.append("")
+                threads_out.append({"thread_ts": thread_ts, "messages": thread_msgs})
+
+            else:
+                # standalone message
+                if thread_ts and ts_val and thread_ts != ts_val:
+                    continue  # skip non-root reply entries if any appear
+
+                transcript_lines.append(f"[{slack_ts_to_str(ts_val, tz)}] @{user}: {text}")
+                transcript_lines.append("")
+
+                threads_out.append({
+                    "thread_ts": None,
+                    "messages": [{
+                        "ts": ts_val,
+                        "user": user,
+                        "text": text,
+                        "is_reply": False,
+                        "permalink": slack_message_permalink(team_id_used, channel_id, ts_val),
+                    }]
+                })
+
+        transcript = "\n".join(transcript_lines).rstrip() + "\n"
+
+        threads_json_obj = {
+            "team_id": team_id_used,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "sync_run_id": sync_run_id,
+            "generated_at_unix": int(time.time()),
+            "threads": threads_out,
+        }
+
+        # 7) Upload artifacts to Firebase Storage
+        bucket = storage.bucket()  # default bucket from Firebase Admin init
+
+        base_path = f"users/{uid}/agents/{agent_id}/slack/{team_id_used}/{channel_id}/sync_runs/{sync_run_id}"
+        transcript_path = f"{base_path}/transcript.txt"
+        threads_path = f"{base_path}/threads.json"
+
+        bucket.blob(transcript_path).upload_from_string(transcript, content_type="text/plain; charset=utf-8")
+        bucket.blob(threads_path).upload_from_string(
+            json.dumps(threads_json_obj, ensure_ascii=False),
+            content_type="application/json; charset=utf-8",
+        )
+
+        # 8) Write Firestore chunk index doc + update source metadata
+        updated_thread_map = dict(thread_latest_reply_ts)
+        updated_thread_map.update(thread_latest_updates)
+
+        chunk_ref = source_ref.collection("transcript_chunks").document(sync_run_id)
+
+        # Also create/update document in teams/{team_id}/sources with random ID
+        user_source_id = secrets.token_urlsafe(16)  # Random document ID
+        user_source_ref = db.collection("teams").document(team_id_solari).collection("sources").document(user_source_id)
+
+        batch = db.batch()
+
+        batch.set(
+            source_ref,
+            {
+                "type": "slack_channel",
+                "channel_id": channel_id,
+                "name": channel_name,
+                "nickname": channel_name,
+                "team_id": team_id_used,
+
+                "last_message_ts": str(max_ts_seen) if max_ts_seen else last_message_ts,
+                "last_synced_at": firestore.SERVER_TIMESTAMP,
+                "last_sync_run_id": sync_run_id,
+
+                "thread_latest_reply_ts": updated_thread_map,
+            },
+            merge=True,
+        )
+
+        # Also update user-level source document (same structure + agent_id)
+        batch.set(
+            user_source_ref,
+            {
+                "type": "slack_channel",
+                "channel_id": channel_id,
+                "name": channel_name,
+                "nickname": channel_name,
+                "team_id": team_id_used,
+                "agent_id": agent_id,  # Track which agent synced this
+
+                "last_message_ts": str(max_ts_seen) if max_ts_seen else last_message_ts,
+                "last_synced_at": firestore.SERVER_TIMESTAMP,
+                "last_sync_run_id": sync_run_id,
+
+                "thread_latest_reply_ts": updated_thread_map,
+            },
+            merge=True,
+        )
+
+        batch.set(
+            chunk_ref,
+            {
+                "sync_run_id": sync_run_id,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "storage_path_transcript": transcript_path,
+                "storage_path_threads": threads_path,
+                "oldest_used": oldest,
+                "last_message_ts": str(max_ts_seen) if max_ts_seen else last_message_ts,
+                "message_count": len(cleaned),
+                "thread_count": len(threads_to_refresh),
+                "team_id": team_id_used,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+            },
+            merge=True,
+        )
+
+        batch.commit()
+
+        # 9) Return small response (pointers + stats)
+        return {
+            "ok": True,
+            "uid": uid,
+            "agent_id": agent_id,
+            "team_id_used": team_id_used,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "sync_run_id": sync_run_id,
+            "oldest_used": oldest,
+            "message_count": len(cleaned),
+            "threads_refreshed": len(threads_to_refresh),
+            "storage": {
+                "transcript_path": transcript_path,
+                "threads_path": threads_path,
+            },
+        }
+    except RuntimeError as e:
+        # Slack API errors
+        return {"ok": False, "error": "slack_api_error", "details": e.args[0]}
+    except Exception as e:
+        # All other exceptions
+        logger.error(f"Error in _sync_channel_transcript_internal: {str(e)}", exc_info=True)
+        return {"ok": False, "error": "sync_exception", "details": str(e)}
+
+# endpoint + work to start a single channel sync/resync
+@app.route("/slack/sync_channel_transcript",  methods=["POST"])
+def slack_sync_channel_transcript():
+    """
+    GET /slack/sync_channel_transcript?uid=...&agent_id=...&channel_id=...&channel_name=...
+    Optional: &team_id=...&tz=America/New_York&limit=500
+    """
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    channel_id = request.args.get("channel_id")
+    channel_name = request.args.get("channel_name")
+    team_id = request.args.get("team_id")
+    tz = request.args.get("tz", "America/New_York")
+    max_messages = int(request.args.get("limit", 500))
+
+    result = _sync_channel_transcript_internal(
+        uid=uid or "",
+        agent_id=agent_id or "",
+        channel_id=channel_id or "",
+        channel_name=channel_name or "",
+        team_id=team_id,
+        tz=tz,
+        limit=max_messages,
+    )
+
+    # Map error types to HTTP status codes
+    if not result.get("ok"):
+        error = result.get("error", "")
+        if error == "missing_uid_agent_id_channel_id_or_channel_name":
+            return jsonify(result), 400
+        elif "KeyError" in str(error) or "not found" in str(error).lower():
+            return jsonify(result), 404
+        elif error == "slack_api_error":
+            return jsonify(result), 502
+        elif error in ("bot_token_missing", "storage_upload_failed", "firestore_write_failed"):
+            return jsonify(result), 500
+        else:
+            return jsonify(result), 500
+
+    return jsonify(result), 200
+
+@app.post("/slack/sync_batch/start")
+def slack_sync_batch_start():
+    """
+    POST /slack/sync_batch/start
+    Body: { uid, agent_id, channels: [{channel_id, channel_name, team_id?}], tz?, limit? }
+
+    Creates a Firestore batch job doc:
+      teams/{team_id}/users/{uid}/agents/{agent_id}/slack_sync_batches/{batch_id}
+
+    The batch job holds a queue of channels to sync, plus progress fields.
+    """
+
+    payload = request.get_json(silent=True) or {}
+    uid = payload.get("uid")
+    agent_id = payload.get("agent_id")
+    channels = payload.get("channels") or []
+    tz = payload.get("tz", "America/New_York")
+    limit = int(payload.get("limit", 500))
+
+    if not uid or not agent_id:
+        return jsonify({"ok": False, "error": "missing_uid_or_agent_id"}), 400
+    if not isinstance(channels, list) or len(channels) == 0:
+        return jsonify({"ok": False, "error": "missing_channels"}), 400
+
+    # Validate & normalize channel objects
+    normalized = []
+    seen = set()
+    for c in channels:
+        if not isinstance(c, dict):
+            continue
+        channel_id = (c.get("channel_id") or "").strip()
+        channel_name = (c.get("channel_name") or "").strip()
+        team_id = (c.get("team_id") or "").strip() or None
+
+        if not channel_id or not channel_name:
+            continue
+
+        key = (team_id or "", channel_id)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        normalized.append({
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "team_id": team_id,      # optional; get_bot_token_for_uid can also infer
+            "status": "queued",      # queued | running | done | error | skipped
+            "started_at": None,
+            "finished_at": None,
+            "result": None,          # store {ok, sync_run_id, storage paths, counts} etc.
+            "error": None,
+        })
+
+    if not normalized:
+        return jsonify({"ok": False, "error": "no_valid_channels"}), 400
+
+    batch_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") + "_" + uuid.uuid4().hex[:8]
+    now_unix = int(time.time())
+
+    try:
+        team_user_ref, _ = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_sync_batches").document(batch_id)
+    )
+
+    # Store queue + progress in one doc (simple for polling)
+    # If you anticipate huge batches (100s), switch queue into a subcollection later.
+    doc = {
+        "batch_id": batch_id,
+        "uid": uid,
+        "agent_id": agent_id,
+        "provider": "slack",
+        "status": "running",          # running | done | error | cancelled
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "started_at_unix": now_unix,
+        "finished_at_unix": None,
+
+        "tz": tz,
+        "limit": limit,
+
+        "total": len(normalized),
+        "completed": 0,
+        "failed": 0,
+
+        "queue": normalized,          # list of per-channel work items
+        "cursor": 0,                  # next index to process
+        "last_tick_at_unix": None,
+    }
+
+    try:
+        batch_ref.set(doc)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "firestore_write_failed", "details": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "total": len(normalized),
+        "status": "running",
+        "next": {
+            "tick_endpoint": "/slack/sync_batch/tick",
+            "status_endpoint": "/slack/sync_batch/status",
+        }
+    })
+
+@app.get("/slack/remove_connection")
+def slack_remove_connection():
+    """
+    GET /slack/remove_connection?uid=...
+    Deletes ALL docs in teams/{team_id}/users/{uid}/slack_installations
+    """
+    uid = request.args.get("uid")
+    if not uid:
+        return jsonify({"ok": False, "error": "missing_uid"}), 400
+
+    db = firestore.client()
+    try:
+        installs_ref, _ = get_slack_installations_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    snaps = list(installs_ref.stream())
+    if not snaps:
+        return jsonify({"ok": True, "uid": uid, "deleted_team_ids": [], "deleted_count": 0})
+
+    batch = db.batch()
+    deleted_ids = []
+    for s in snaps:
+        batch.delete(installs_ref.document(s.id))
+        deleted_ids.append(s.id)
+    batch.commit()
+
+    return jsonify({"ok": True, "uid": uid, "deleted_team_ids": deleted_ids, "deleted_count": len(deleted_ids)})
+
+
+@app.get("/slack/transcript_threads")
+def slack_get_transcript_threads():
+    """
+    GET /slack/transcript_threads?uid=...&agent_id=...&source_id=...
+    Optional: &before_last_message_ts=1767566366.641149
+    """
+
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    source_id = request.args.get("source_id")  # Slack channel id (your source doc id)
+    before_ts = request.args.get("before_last_message_ts")  # optional
+
+    if not uid or not agent_id or not source_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_source_id"}), 400
+
+    try:
+        _, team_id_solari = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    source_ref = (
+        db.collection("teams").document(team_id_solari)
+          .collection("agents").document(agent_id)
+          .collection("sources").document(source_id)
+    )
+    if not source_ref.get().exists:
+        return jsonify({"ok": False, "error": "source_not_found"}), 404
+
+    chunks_ref = source_ref.collection("transcript_chunks")
+
+    # ---- Query latest chunk by last_message_ts (with optional pagination) ----
+    def query_by_last_message_ts():
+        q = chunks_ref.order_by("last_message_ts", direction=firestore.Query.DESCENDING)
+        if before_ts:
+            q = q.where("last_message_ts", "<", before_ts)
+        return list(q.limit(1).stream())
+
+    def query_by_created_at_fallback():
+        q = chunks_ref.order_by("created_at", direction=firestore.Query.DESCENDING)
+        # Pagination fallback: if you want "older" reliably, prefer before_created_at instead.
+        # We'll keep it simple: if before_ts is set and last_message_ts ordering fails,
+        # we still return the latest by created_at (or you can extend later).
+        return list(q.limit(1).stream())
+
+    try:
+        chunk_snaps = query_by_last_message_ts()
+    except Exception:
+        chunk_snaps = query_by_created_at_fallback()
+
+    if not chunk_snaps:
+        return jsonify({"ok": False, "error": "no_transcript_chunks_found"}), 404
+
+    chunk = chunk_snaps[0].to_dict() or {}
+    storage_path = chunk.get("storage_path_threads")
+    if not storage_path:
+        return jsonify({"ok": False, "error": "missing_storage_path_threads"}), 500
+
+    # ---- Download threads.json from Firebase Storage ----
+    try:
+        bucket = storage.bucket()
+        blob = bucket.blob(storage_path)
+        raw = blob.download_as_text(encoding="utf-8")
+        threads_json = json.loads(raw)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "failed_to_load_threads_json", "details": str(e)}), 500
+
+    # ---- Response (UI-ready) ----
+    return jsonify({
+        "ok": True,
+        "uid": uid,
+        "agent_id": agent_id,
+        "source_id": source_id,
+        "sync_run_id": chunk.get("sync_run_id") or (threads_json.get("sync_run_id") if isinstance(threads_json, dict) else None),
+        "created_at": chunk.get("created_at"),
+        "last_message_ts": chunk.get("last_message_ts"),
+        "storage_path_threads": storage_path,
+        "threads_json": threads_json,
+    })
+
+@app.get("/slack/transcript_chunks/list")
+def slack_list_transcript_chunks():
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    source_id = request.args.get("source_id")
+    limit = int(request.args.get("limit", 20))
+
+    if not uid or not agent_id or not source_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_source_id"}), 400
+
+    try:
+        _, team_id_solari = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    chunks_ref = (
+        db.collection("teams").document(team_id_solari)
+          .collection("agents").document(agent_id)
+          .collection("sources").document(source_id)
+          .collection("transcript_chunks")
+    )
+
+    snaps = list(
+        chunks_ref.order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+    )
+
+    items = []
+    for s in snaps:
+        d = s.to_dict() or {}
+        lmt = d.get("last_message_ts")
+        items.append({
+            "doc_id": s.id,
+            "sync_run_id": d.get("sync_run_id"),
+            "created_at": d.get("created_at"),
+            "last_message_ts": lmt,
+            "last_message_ts_type": type(lmt).__name__,
+            "storage_path_threads": d.get("storage_path_threads"),
+        })
+
+    return jsonify({"ok": True, "count": len(items), "items": items})
+
+@app.get("/slack/transcript_by_sync_run")
+def slack_transcript_by_sync_run():
+    """
+    GET /slack/transcript_by_sync_run?uid=...&agent_id=...&source_id=...&sync_run_id=...
+    Returns the threads.json payload for that exact sync run.
+    """
+
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    source_id = request.args.get("source_id")  # channel id (your source doc id)
+    sync_run_id = request.args.get("sync_run_id")
+
+    if not uid or not agent_id or not source_id or not sync_run_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_source_id_or_sync_run_id"}), 400
+
+    try:
+        _, team_id_solari = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    chunk_ref = (
+        db.collection("teams").document(team_id_solari)
+          .collection("agents").document(agent_id)
+          .collection("sources").document(source_id)
+          .collection("transcript_chunks").document(sync_run_id)
+    )
+
+    snap = chunk_ref.get()
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "chunk_not_found", "sync_run_id": sync_run_id}), 404
+
+    chunk = snap.to_dict() or {}
+    storage_path = chunk.get("storage_path_threads")
+    if not storage_path:
+        return jsonify({"ok": False, "error": "missing_storage_path_threads", "sync_run_id": sync_run_id}), 500
+
+    # Download the JSON from Firebase Storage
+    try:
+        bucket = storage.bucket()
+        blob = bucket.blob(storage_path)
+        raw = blob.download_as_text(encoding="utf-8")
+        threads_json = json.loads(raw)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "failed_to_load_threads_json", "details": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "uid": uid,
+        "agent_id": agent_id,
+        "source_id": source_id,
+        "sync_run_id": sync_run_id,
+        "created_at": chunk.get("created_at"),
+        "last_message_ts": chunk.get("last_message_ts"),
+        "storage_path_threads": storage_path,  # handy for debugging; remove later if you want
+        "threads_json": threads_json,
+    })
+
+# endpoint to get the status of a job
+@app.get("/slack/sync_batch/status")
+def slack_sync_batch_status():
+    """
+    GET /slack/sync_batch/status?uid=...&agent_id=...&batch_id=...
+    """
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    batch_id = request.args.get("batch_id")
+
+    if not uid or not agent_id or not batch_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_batch_id"}), 400
+
+    try:
+        team_user_ref, _ = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_sync_batches").document(batch_id)
+    )
+
+    snap = batch_ref.get()
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "batch_not_found"}), 404
+
+    doc = snap.to_dict() or {}
+    # Return only what the UI needs
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "uid": uid,
+        "agent_id": agent_id,
+        "status": doc.get("status"),
+        "total": doc.get("total", 0),
+        "completed": doc.get("completed", 0),
+        "failed": doc.get("failed", 0),
+        "cursor": doc.get("cursor", 0),
+        "queue": doc.get("queue", []),
+        "last_tick_at_unix": doc.get("last_tick_at_unix"),
+        "finished_at_unix": doc.get("finished_at_unix"),
+    })
+
+# tick - for the batch job to do an increment of channel syncing work
+@app.get("/slack/sync_batch/tick")
+def slack_sync_batch_tick():
+    """
+    GET /slack/sync_batch/tick?uid=...&agent_id=...&batch_id=...
+    Processes exactly ONE channel from the queue per call.
+    """
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    batch_id = request.args.get("batch_id")
+
+    if not uid or not agent_id or not batch_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_batch_id"}), 400
+
+    try:
+        team_user_ref, _ = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_sync_batches").document(batch_id)
+    )
+
+    now_unix = int(time.time())
+
+    # --- Step A: claim one unit of work (transaction lock) ---
+    @firestore.transactional
+    def claim_work(txn: firestore.Transaction):
+        snap = batch_ref.get(transaction=txn)
+        if not snap.exists:
+            return {"ok": False, "error": "batch_not_found"}
+
+        doc = snap.to_dict() or {}
+        status = doc.get("status")
+        if status not in ("running",):
+            return {"ok": False, "error": "batch_not_running", "status": status}
+
+        queue = doc.get("queue", []) or []
+        cursor = int(doc.get("cursor", 0) or 0)
+
+        if cursor >= len(queue):
+            # Mark done
+            txn.update(batch_ref, {
+                "status": "done",
+                "finished_at_unix": doc.get("finished_at_unix") or now_unix,
+                "last_tick_at_unix": now_unix,
+            })
+            return {"ok": True, "done": True, "doc": doc}
+
+        item = queue[cursor] or {}
+        # If item is already done/errored for some reason, advance cursor and let next tick handle next
+        if item.get("status") in ("done", "error", "skipped"):
+            txn.update(batch_ref, {
+                "cursor": cursor + 1,
+                "last_tick_at_unix": now_unix,
+            })
+            return {"ok": True, "skipped_cursor_advance": True, "doc": doc}
+
+        # Mark this item as running
+        item["status"] = "running"
+        item["started_at_unix"] = now_unix
+
+        queue[cursor] = item
+
+        txn.update(batch_ref, {
+            "queue": queue,
+            "last_tick_at_unix": now_unix,
+        })
+
+        # Return the claimed work
+        return {
+            "ok": True,
+            "done": False,
+            "cursor": cursor,
+            "item": item,
+            "doc": doc,
+        }
+
+    txn = db.transaction()
+    claim = claim_work(txn)
+
+    if not claim.get("ok"):
+        return jsonify(claim), (404 if claim.get("error") == "batch_not_found" else 400)
+
+    if claim.get("done"):
+        doc = claim.get("doc") or {}
+        return jsonify({
+            "ok": True,
+            "batch_id": batch_id,
+            "status": "done",
+            "total": doc.get("total", 0),
+            "completed": doc.get("completed", 0),
+            "failed": doc.get("failed", 0),
+        })
+
+    # If we only advanced cursor due to already-done items, tell UI to call again
+    if claim.get("skipped_cursor_advance"):
+        doc = claim.get("doc") or {}
+        return jsonify({
+            "ok": True,
+            "batch_id": batch_id,
+            "status": doc.get("status", "running"),
+            "total": doc.get("total", 0),
+            "completed": doc.get("completed", 0),
+            "failed": doc.get("failed", 0),
+            "note": "advanced_cursor_over_completed_item",
+        })
+
+    cursor = claim["cursor"]
+    item = claim["item"]
+    tz = (claim.get("doc") or {}).get("tz", "America/New_York")
+    limit = int((claim.get("doc") or {}).get("limit", 500))
+
+    channel_id = item.get("channel_id")
+    channel_name = item.get("channel_name")
+    team_id = item.get("team_id")  # optional
+
+    # --- Step B: do the actual channel sync (this is where transcripts are generated) ---
+    result = _sync_channel_transcript_internal(
+        uid=uid,
+        agent_id=agent_id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        team_id=team_id,
+        tz=tz,
+        limit=limit,
+    )
+
+    # --- Step C: write result back & advance cursor ---
+    @firestore.transactional
+    def commit_result(txn: firestore.Transaction):
+        snap = batch_ref.get(transaction=txn)
+        if not snap.exists:
+            return {"ok": False, "error": "batch_not_found"}
+
+        doc = snap.to_dict() or {}
+        queue = doc.get("queue", []) or []
+        total = int(doc.get("total", len(queue)) or len(queue))
+        completed = int(doc.get("completed", 0) or 0)
+        failed = int(doc.get("failed", 0) or 0)
+
+        if cursor >= len(queue):
+            return {"ok": False, "error": "cursor_out_of_bounds"}
+
+        qitem = queue[cursor] or {}
+        qitem["finished_at_unix"] = now_unix
+        qitem["result"] = result if isinstance(result, dict) else {"ok": False, "error": "bad_result_shape"}
+
+        if result.get("ok"):
+            qitem["status"] = "done"
+            completed += 1
+        else:
+            qitem["status"] = "error"
+            qitem["error"] = result.get("error") or "unknown_error"
+            failed += 1
+
+        queue[cursor] = qitem
+
+        new_cursor = cursor + 1
+        new_status = "running"
+        finished_at_unix = None
+        if new_cursor >= len(queue):
+            new_status = "done"
+            finished_at_unix = now_unix
+
+        txn.update(batch_ref, {
+            "queue": queue,
+            "cursor": new_cursor,
+            "completed": completed,
+            "failed": failed,
+            "status": new_status,
+            "finished_at_unix": finished_at_unix,
+            "last_tick_at_unix": now_unix,
+        })
+
+        return {
+            "ok": True,
+            "status": new_status,
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "just_processed": {
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "result": result,
+            }
+        }
+
+    txn2 = db.transaction()
+    out = commit_result(txn2)
+
+    # Return UI-friendly progress
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        **out
+    })
+
+# retry a channel + clean up the batch tracking in firebase
+@app.route("/slack/batch_channel_retry", methods=["POST"])
+def slack_batch_channel_retry():
+    """
+    POST /slack/batch_channel_retry?uid=...&agent_id=...&channel_id=...&channel_name=...&batch_id=...
+    Optional: &team_id=...&tz=America/New_York&limit=500
+    
+    Syncs a channel and updates the batch queue to mark that channel as done.
+    """
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    channel_id = request.args.get("channel_id")
+    channel_name = request.args.get("channel_name")
+    batch_id = request.args.get("batch_id")
+    team_id = request.args.get("team_id")
+    tz = request.args.get("tz", "America/New_York")
+    max_messages = int(request.args.get("limit", 500))
+
+    if not uid or not agent_id or not channel_id or not channel_name or not batch_id:
+        return jsonify({
+            "ok": False,
+            "error": "missing_uid_agent_id_channel_id_channel_name_or_batch_id"
+        }), 400
+
+    # Step 1: Sync the channel
+    result = _sync_channel_transcript_internal(
+        uid=uid,
+        agent_id=agent_id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        team_id=team_id,
+        tz=tz,
+        limit=max_messages,
+    )
+
+    # Step 2 & 3: Update the batch queue
+    try:
+        team_user_ref, _ = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_sync_batches").document(batch_id)
+    )
+
+    now_unix = int(time.time())
+
+    @firestore.transactional
+    def update_batch_queue(txn: firestore.Transaction):
+        snap = batch_ref.get(transaction=txn)
+        if not snap.exists:
+            return {"ok": False, "error": "batch_not_found"}
+
+        doc = snap.to_dict() or {}
+        queue = doc.get("queue", []) or []
+        completed = int(doc.get("completed", 0) or 0)
+        failed = int(doc.get("failed", 0) or 0)
+
+        # Find the channel in the queue
+        channel_found = False
+        for i, item in enumerate(queue):
+            item_channel_id = item.get("channel_id")
+            item_team_id = item.get("team_id")
+            
+            # Match by channel_id, and optionally by team_id if both are present
+            if item_channel_id == channel_id:
+                if team_id is None or item_team_id == team_id or (item_team_id is None and team_id is None):
+                    # Found the channel, update it with latest result
+                    previous_status = item.get("status", "queued")
+                    
+                    queue[i]["finished_at_unix"] = now_unix
+                    queue[i]["result"] = result if isinstance(result, dict) else {"ok": False, "error": "bad_result_shape"}
+                    
+                    if result.get("ok"):
+                        # Success: mark as done
+                        queue[i]["status"] = "done"
+                        queue[i].pop("error", None)  # Remove error field if it exists
+                        
+                        # Adjust counts: if it was previously "error", move from failed to completed
+                        if previous_status == "error":
+                            failed = max(0, failed - 1)  # Don't go negative
+                            completed += 1
+                        elif previous_status != "done":
+                            # Was queued/running, now done
+                            completed += 1
+                    else:
+                        # Error: mark as error with new error message
+                        queue[i]["status"] = "error"
+                        queue[i]["error"] = result.get("error") or "unknown_error"
+                        
+                        # Adjust counts: if it was previously "done", move from completed to failed
+                        if previous_status == "done":
+                            completed = max(0, completed - 1)  # Don't go negative
+                            failed += 1
+                        elif previous_status != "error":
+                            # Was queued/running, now error
+                            failed += 1
+                    
+                    channel_found = True
+                    break
+
+        if not channel_found:
+            return {"ok": False, "error": "channel_not_found_in_batch_queue"}
+
+        # Update the batch document
+        txn.update(batch_ref, {
+            "queue": queue,
+            "completed": completed,
+            "failed": failed,
+            "last_tick_at_unix": now_unix,
+        })
+
+        return {
+            "ok": True,
+            "completed": completed,
+            "failed": failed,
+            "total": doc.get("total", len(queue)),
+        }
+
+    txn = db.transaction()
+    batch_update = update_batch_queue(txn)
+
+    if not batch_update.get("ok"):
+        error = batch_update.get("error", "")
+        if error == "batch_not_found":
+            return jsonify(batch_update), 404
+        elif error == "channel_not_found_in_batch_queue":
+            return jsonify(batch_update), 400
+        else:
+            return jsonify(batch_update), 500
+
+    # Return combined result
+    return jsonify({
+        "ok": True,
+        "sync_result": result,
+        "batch_id": batch_id,
+        "completed": batch_update.get("completed"),
+        "failed": batch_update.get("failed"),
+        "total": batch_update.get("total"),
+    }), 200
+
+def _new_6digit_code() -> str:
+    return str(secrets.randbelow(1_000_000)).zfill(6)
+
+@app.post("/teams/create_invite_code")
+def teams_create_invite_code():
+    """
+    POST /teams/create_invite_code
+    Body JSON:
+      { "uid": "...", "team_id": "..." }
+
+    Claims a globally-unique 6-digit code by creating:
+      team_invite_codes/{code} -> { team_id, created_by_uid, created_at }
+    """
+    body = request.get_json(silent=True) or {}
+    uid = (body.get("uid") or "").strip()
+    team_id = (body.get("team_id") or "").strip()
+
+    db = firestore.client()
+
+    if not uid or not team_id:
+        return jsonify({"ok": False, "error": "missing_uid_or_team_id"}), 400
+
+    # Optional: verify team exists
+    team_ref = db.collection("teams").document(team_id)
+    if not team_ref.get().exists:
+        return jsonify({"ok": False, "error": "team_not_found"}), 404
+
+    max_attempts = 50
+    for _ in range(max_attempts):
+        code = _new_6digit_code()
+        code_ref = db.collection("team_invite_codes").document(code)
+
+        try:
+            # create() is atomic and fails if doc already exists
+            code_ref.create({
+                "team_id": team_id,
+                "created_by_uid": uid,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "status": "active",
+                "code": code,
+            })
+
+            # NEW: persist invite code on team doc
+            team_ref.set({
+                "invite_code": code,
+            }, merge=True)
+
+            return jsonify({"ok": True, "team_id": team_id, "invite_code": code})
+        except Exception as e:
+            msg = str(e).lower()
+            if "already exists" in msg or "alreadyexists" in msg:
+                continue
+            return jsonify({"ok": False, "error": "firestore_error", "details": str(e)}), 500
+
+    return jsonify({"ok": False, "error": "could_not_allocate_unique_code"}), 503
+
+@app.post("/team/join_team_invite_code")
+def team_join_team_invite_code():
+    """
+    POST /team/join_team_invite_code
+    Body JSON:
+      { "invite_code": "123456" }
+
+    Returns the team_id for a valid invite code.
+    """
+    body = request.get_json(silent=True) or {}
+    invite_code = (body.get("invite_code") or "").strip()
+
+    if not invite_code:
+        return jsonify({"ok": False, "error": "missing_invite_code"}), 400
+
+    db = firestore.client()
+    code_ref = db.collection("team_invite_codes").document(invite_code)
+    snap = code_ref.get()
+
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "invite_code_not_found"}), 404
+
+    data = snap.to_dict() or {}
+    team_id = data.get("team_id")
+    if not team_id:
+        return jsonify({"ok": False, "error": "team_id_missing_for_code"}), 500
+
+    return jsonify({"ok": True, "invite_code": invite_code, "team_id": team_id})
+
+# @app.post("/teams/invite_members")
+# def teams_invite_members():
+#     """
+#     POST /teams/invite_members
+#     Body JSON:
+#       { "team_id": "...", "emails": ["a@b.com", "c@d.com"] }
+
+#     For now, just log the payload and return a confirmation response.
+#     """
+#     body = request.get_json(silent=True) or {}
+#     team_id = (body.get("team_id") or "").strip()
+#     emails = body.get("emails")
+
+#     if not team_id:
+#         return jsonify({"ok": False, "error": "missing_team_id"}), 400
+#     if not isinstance(emails, list) or not emails:
+#         return jsonify({"ok": False, "error": "missing_emails"}), 400
+
+#     cleaned_emails = [str(e).strip() for e in emails if str(e).strip()]
+#     if not cleaned_emails:
+#         return jsonify({"ok": False, "error": "no_valid_emails"}), 400
+
+#     logger.info(f"Invite members requested for team_id={team_id}, emails={cleaned_emails}")
+#     return jsonify({"ok": True, "team_id": team_id, "emails": cleaned_emails})
+
+@app.post("/teams/get_creator_first_name")
+def teams_get_creator_first_name():
+    """
+    POST /teams/get_creator_first_name
+    Body JSON:
+      { "team_id": "...", "user_id": "..." }
+
+    Returns the first name of the user who created the team, scoped to a user in that team.
+    """
+    body = request.get_json(silent=True) or {}
+    team_id = (body.get("team_id") or "").strip()
+    user_id = (body.get("user_id") or "").strip()
+
+    first_name, creator_uid, error = _get_team_creator_first_name(team_id, user_id)
+    if error:
+        return jsonify({"ok": False, "error": error["message"]}), error["status"]
+
+    return jsonify({
+        "ok": True,
+        "team_id": team_id,
+        "creator_uid": str(creator_uid),
+        "creator_first_name": first_name,
+    })
+
+@app.post("/api/team/list_members")
+@require_solari_key
+def team_list_members():
+    """
+    POST /api/team/list_members
+    Body JSON:
+      { "teamId": "...", "userId": "..." }
+
+    Returns displayName, email, and role for each team member.
+    """
+    body = request.get_json(silent=True) or {}
+    team_id = (body.get("teamId") or "").strip()
+    user_id = (body.get("userId") or "").strip()
+
+    if not team_id or not user_id:
+        return jsonify({"ok": False, "error": "missing_team_id_or_user_id"}), 400
+
+    db = firestore.client()
+    user_snap = db.collection("users").document(user_id).get()
+    if not user_snap.exists:
+        return jsonify({"ok": False, "error": "user_not_found"}), 404
+
+    user_data = user_snap.to_dict() or {}
+    if (user_data.get("teamId") or "").strip() != team_id:
+        return jsonify({"ok": False, "error": "user_not_in_team"}), 403
+
+    members_ref = db.collection("teams").document(team_id).collection("users")
+    members_snaps = members_ref.stream()
+
+    members = []
+    for snap in members_snaps:
+        data = snap.to_dict() or {}
+        members.append({
+            "uid": data.get("uid") or snap.id,
+            "displayName": data.get("displayName"),
+            "email": data.get("email"),
+            "role": data.get("role"),
+            "agents": data.get("agents") or [],
+        })
+
+    return jsonify({
+        "ok": True,
+        "team_id": team_id,
+        "members": members,
+    })
+
+@app.post("/api/team/update-member-role")
+@require_solari_key
+def team_update_member_role():
+    """
+    POST /api/team/update-member-role
+    Body JSON:
+      { "teamId": "...", "userId": "...", "role": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    team_id = (body.get("teamId") or "").strip()
+    user_id = (body.get("userId") or "").strip()
+    role = (body.get("role") or "").strip()
+
+    if not team_id or not user_id or not role:
+        return jsonify({"ok": False, "error": "missing_team_id_user_id_or_role"}), 400
+
+    db = firestore.client()
+    user_snap = db.collection("users").document(user_id).get()
+    if not user_snap.exists:
+        return jsonify({"ok": False, "error": "user_not_found"}), 404
+
+    user_data = user_snap.to_dict() or {}
+    if (user_data.get("teamId") or "").strip() != team_id:
+        return jsonify({"ok": False, "error": "user_not_in_team"}), 403
+
+    member_ref = db.collection("teams").document(team_id).collection("users").document(user_id)
+    member_snap = member_ref.get()
+    if not member_snap.exists:
+        return jsonify({"ok": False, "error": "member_not_found"}), 404
+
+    member_ref.set({"role": role}, merge=True)
+
+    return jsonify({
+        "ok": True,
+        "team_id": team_id,
+        "user_id": user_id,
+        "role": role,
+    })
+
+def _get_team_creator_first_name(team_id: str, user_id: str):
+    if not team_id or not user_id:
+        return None, None, {"message": "missing_team_id_or_user_id", "status": 400}
+
+    db = firestore.client()
+    team_ref = db.collection("teams").document(team_id)
+    team_snap = team_ref.get()
+    if not team_snap.exists:
+        return None, None, {"message": "team_not_found", "status": 404}
+
+    user_ref = db.collection("users").document(str(user_id))
+    user_snap = user_ref.get()
+    if not user_snap.exists:
+        return None, None, {"message": "user_not_found", "status": 404}
+
+    user_data = user_snap.to_dict() or {}
+    if (user_data.get("teamId") or "").strip() != team_id:
+        return None, None, {"message": "user_not_in_team", "status": 403}
+
+    team_data = team_snap.to_dict() or {}
+    creator_uid = team_data.get("createdBy")
+    if not creator_uid:
+        return None, None, {"message": "team_creator_missing", "status": 500}
+
+    creator_ref = db.collection("users").document(str(creator_uid))
+    creator_snap = creator_ref.get()
+    if not creator_snap.exists:
+        return None, None, {"message": "team_creator_not_found", "status": 404}
+
+    creator_data = creator_snap.to_dict() or {}
+    display_name = (creator_data.get("displayName") or "").strip()
+    if not display_name:
+        return None, None, {"message": "creator_display_name_missing", "status": 500}
+
+    first_name = display_name.split()[0]
+    return first_name, creator_uid, None
 
 if __name__ == '__main__':
     # Get port from environment or default to 5000
