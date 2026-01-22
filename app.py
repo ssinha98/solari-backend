@@ -4,7 +4,7 @@ import io
 import tempfile
 import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, request, make_response, redirect
 from werkzeug.exceptions import BadRequest
 from flask_cors import CORS
@@ -530,13 +530,13 @@ def jira_connect():
     Usage: GET /auth/jira/connect?uid={user_id}&client_id={jira_client_id}
     """
     uid = request.args.get("uid")
-    client_id = request.args.get("client_id")
+    client_id = request.args.get("client_id") or os.getenv("JIRA_CLIENT_ID")
     
     if not uid:
         return jsonify({"error": "Missing uid parameter"}), 400
     
     if not client_id:
-        return jsonify({"error": "Missing client_id parameter"}), 400
+        return jsonify({"error": "Jira client_id not configured"}), 500
     
     query_params = {
     "audience": "api.atlassian.com",
@@ -632,10 +632,11 @@ def jira_oauth_callback():
 
         logger.info(f"Got Jira info - cloud_id: {cloud_id}, site_url: {jira_site_url}")
 
-        # 4. ✅ Save tokens securely to Firestore
+        # 4. ✅ Save tokens securely to Firestore (team-scoped)
         try:
             db = firestore.client()
-            db.collection("users").document(uid).set({
+            team_id = get_team_id_for_uid(db, uid)
+            db.collection("teams").document(team_id).set({
                 "jira_access_token": access_token,
                 "jira_refresh_token": refresh_token,
                 "jira_cloud_id": cloud_id,
@@ -644,7 +645,10 @@ def jira_oauth_callback():
                 "jira_connected_at": firestore.SERVER_TIMESTAMP,
                 "jira_expires_at": datetime.utcnow() + timedelta(seconds=expires_in)
             }, merge=True)
-            logger.info(f"✅ Jira OAuth saved in Firestore for user {uid}")
+            logger.info(f"✅ Jira OAuth saved in Firestore for team {team_id} (user {uid})")
+        except KeyError as e:
+            logger.error(f"Failed to resolve team for user {uid}: {str(e)}")
+            return jsonify({"error": "Failed to resolve team for user"}), 400
         except Exception as e:
             logger.error(f"Failed to save OAuth tokens for user {uid}: {str(e)}")
             return jsonify({"error": "Failed to save OAuth credentials"}), 500
@@ -716,23 +720,28 @@ def _refresh_jira_access_token(user_id: str, refresh_token: str) -> dict:
 
 def get_atlassian_access_token(user_id: str) -> str:
     """
-    Get a valid Atlassian access token for a user, refreshing if expired.
+    Get a valid Atlassian access token for a team, refreshing if expired.
     
     Args:
-        user_id: Firebase user ID
+        user_id: Firebase user ID (used to resolve team)
     
     Returns:
         Valid access token string
     
     Raises:
-        Exception if user not found, credentials missing, or refresh fails
+        Exception if user/team not found, credentials missing, or refresh fails
     """
     db = firestore.client()
-    doc_ref = db.collection("users").document(user_id)
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError:
+        raise Exception(f"User {user_id} not found in Firestore")
+
+    doc_ref = db.collection("teams").document(team_id)
     doc = doc_ref.get()
     
     if not doc.exists:
-        raise Exception(f"User {user_id} not found in Firestore")
+        raise Exception(f"Team {team_id} not found in Firestore")
     
     user_data = doc.to_dict() or {}
     access_token = user_data.get("jira_access_token")
@@ -740,7 +749,7 @@ def get_atlassian_access_token(user_id: str) -> str:
     expires_at = user_data.get("jira_expires_at")
     
     if not access_token or not refresh_token:
-        raise Exception(f"Jira credentials not found for user {user_id}. Please complete OAuth flow.")
+        raise Exception(f"Jira credentials not found for team {team_id}. Please complete OAuth flow.")
     
     # Check if token is expired
     # expires_at is a Firestore timestamp, convert to datetime if needed
@@ -755,7 +764,7 @@ def get_atlassian_access_token(user_id: str) -> str:
         
         # Add 60 second buffer to refresh before actual expiration
         if datetime.utcnow() >= (expires_datetime - timedelta(seconds=60)):
-            logger.info(f"Access token expired for user {user_id}, refreshing...")
+            logger.info(f"Access token expired for team {team_id}, refreshing...")
             
             # Refresh the token
             new_tokens = _refresh_jira_access_token(user_id, refresh_token)
@@ -770,7 +779,7 @@ def get_atlassian_access_token(user_id: str) -> str:
                 "jira_expires_at": datetime.utcnow() + timedelta(seconds=expires_in)
             })
             
-            logger.info(f"Successfully refreshed access token for user {user_id}")
+            logger.info(f"Successfully refreshed access token for team {team_id}")
             return new_access_token
     
     # Token is still valid
@@ -778,25 +787,30 @@ def get_atlassian_access_token(user_id: str) -> str:
 
 def _get_jira_creds(user_id: str):
     """
-    Retrieve Jira OAuth credentials from Firestore for a user.
+    Retrieve Jira OAuth credentials from Firestore for a team.
     Automatically refreshes token if expired.
     
     Returns:
         dict with keys: access_token, cloud_id, site_url
     Raises:
-        Exception if user not found or credentials missing
+        Exception if user/team not found or credentials missing
     """
     db = firestore.client()
-    user_doc = db.collection("users").document(user_id).get()
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError:
+        raise Exception(f"User {user_id} not found in Firestore")
+
+    user_doc = db.collection("teams").document(team_id).get()
     
     if not user_doc.exists:
-        raise Exception(f"User {user_id} not found in Firestore")
+        raise Exception(f"Team {team_id} not found in Firestore")
     
     user_data = user_doc.to_dict() or {}
     cloud_id = user_data.get("jira_cloud_id")
     
     if not cloud_id:
-        raise Exception(f"Jira credentials not found for user {user_id}. Please complete OAuth flow.")
+        raise Exception(f"Jira credentials not found for team {team_id}. Please complete OAuth flow.")
     
     # Get valid access token (refreshes if needed)
     access_token = get_atlassian_access_token(user_id)
@@ -1851,6 +1865,405 @@ def pinecone_website_upload():
             'status': 'error',
             'message': f'Failed to process website: {str(e)}'
         }), 500
+
+@app.route('/api/pinecone_slack_upload', methods=['POST'])
+@require_solari_key
+def pinecone_slack_upload():
+    """
+    Upload latest Slack transcript chunk to Pinecone.
+
+    Expected request body:
+    {
+        "uid": "...",
+        "agent_id": "...",
+        "source_id": "...",   # slack channel id (optional if channel_id provided)
+        "channel_id": "...",  # optional, defaults to source_id
+        "channel_name": "...",  # optional if existing source has name
+        "namespace": "...",
+        "nickname": "...",  # optional
+        "chunk_n": 20,     # optional
+        "overlap_n": 5     # optional
+    }
+    """
+    try:
+        data = request.get_json() or {}
+
+        uid = data.get("uid")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        source_id = data.get("source_id") or data.get("sourceId")
+        channel_id = data.get("channel_id") or data.get("channelId") or source_id
+        channel_name = data.get("channel_name") or data.get("channelName")
+        namespace = data.get("namespace")
+        nickname = data.get("nickname", "")
+        team_id = data.get("team_id") or data.get("teamId")
+
+        if not uid or not agent_id or not channel_id or not namespace:
+            return jsonify({
+                "status": "error",
+                "message": "uid, agent_id, channel_id (or source_id), and namespace are required"
+            }), 400
+
+        chunk_n = int(data.get("chunk_n", 20))
+        overlap_n = int(data.get("overlap_n", 5))
+
+        db = firestore.client()
+
+        try:
+            result = pinecone_slack_upload_internal(
+                db=db,
+                uid=uid,
+                agent_id=agent_id,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                namespace=namespace,
+                nickname=nickname,
+                chunk_n=chunk_n,
+                overlap_n=overlap_n,
+                team_id=team_id,
+                source_id=source_id or channel_id,
+            )
+        except KeyError as e:
+            return jsonify({"status": "error", "message": str(e)}), 404
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"failed_to_load_transcript: {str(e)}"}), 500
+
+        if not result.get("ok"):
+            error = result.get("error")
+            status = 500
+            if error in ("missing_channel_id_or_namespace", "channel_name_required"):
+                status = 400
+            elif error == "slack_api_error":
+                status = 502
+            elif error in ("no_messages_to_upload",):
+                status = 400
+            return jsonify({"status": "error", "message": error, "details": result.get("details")}), status
+
+        result["status"] = "success"
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Error processing Slack transcript upload: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": f"failed_to_process_slack_transcript: {str(e)}"
+        }), 500
+
+@app.post("/api/pinecone_slack_upload_batch")
+@require_solari_key
+def pinecone_slack_upload_batch_start():
+    """
+    Start a batch Pinecone upload for Slack channels.
+
+    Expected request body:
+    {
+        "uid": "...",
+        "agent_id": "...",
+        "namespace": "...",
+        "chunk_n": 20,     # optional
+        "overlap_n": 5,    # optional
+        "channels": [
+            {"channel_id": "...", "channel_name": "...", "nickname": "..." }
+        ]
+    }
+    """
+    payload = request.get_json(silent=True) or {}
+    uid = payload.get("uid")
+    agent_id = payload.get("agent_id") or payload.get("agentId")
+    namespace = payload.get("namespace")
+    channels = payload.get("channels") or []
+    chunk_n = int(payload.get("chunk_n", 20))
+    overlap_n = int(payload.get("overlap_n", 5))
+
+    if not uid or not agent_id or not namespace:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_namespace"}), 400
+    if not isinstance(channels, list) or len(channels) == 0:
+        return jsonify({"ok": False, "error": "missing_channels"}), 400
+
+    normalized = []
+    seen = set()
+    for c in channels:
+        if not isinstance(c, dict):
+            continue
+        channel_id = (c.get("channel_id") or c.get("channelId") or "").strip()
+        channel_name = (c.get("channel_name") or c.get("channelName") or "").strip()
+        nickname = (c.get("nickname") or "").strip()
+        if not channel_id or not channel_name:
+            continue
+        key = (channel_id, channel_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "nickname": nickname,
+            "status": "queued",
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        })
+
+    if not normalized:
+        return jsonify({"ok": False, "error": "no_valid_channels"}), 400
+
+    batch_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") + "_" + uuid.uuid4().hex[:8]
+    now_unix = int(time.time())
+
+    try:
+        team_user_ref, _ = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_pinecone_batches").document(batch_id)
+    )
+
+    doc = {
+        "batch_id": batch_id,
+        "uid": uid,
+        "agent_id": agent_id,
+        "provider": "slack",
+        "status": "running",
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "started_at_unix": now_unix,
+        "finished_at_unix": None,
+
+        "namespace": namespace,
+        "chunk_n": chunk_n,
+        "overlap_n": overlap_n,
+
+        "total": len(normalized),
+        "completed": 0,
+        "failed": 0,
+
+        "queue": normalized,
+        "cursor": 0,
+        "last_tick_at_unix": None,
+    }
+
+    try:
+        batch_ref.set(doc)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "firestore_write_failed", "details": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "total": len(normalized),
+        "status": "running",
+        "next": {
+            "tick_endpoint": "/api/pinecone_slack_upload_batch/tick",
+            "status_endpoint": "/api/pinecone_slack_upload_batch/status",
+        }
+    })
+
+@app.get("/api/pinecone_slack_upload_batch/status")
+@require_solari_key
+def pinecone_slack_upload_batch_status():
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    batch_id = request.args.get("batch_id")
+
+    if not uid or not agent_id or not batch_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_batch_id"}), 400
+
+    try:
+        team_user_ref, _ = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_pinecone_batches").document(batch_id)
+    )
+
+    snap = batch_ref.get()
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "batch_not_found"}), 404
+
+    doc = snap.to_dict() or {}
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "uid": uid,
+        "agent_id": agent_id,
+        "status": doc.get("status"),
+        "total": doc.get("total", 0),
+        "completed": doc.get("completed", 0),
+        "failed": doc.get("failed", 0),
+        "cursor": doc.get("cursor", 0),
+        "queue": doc.get("queue", []),
+        "last_tick_at_unix": doc.get("last_tick_at_unix"),
+        "finished_at_unix": doc.get("finished_at_unix"),
+    })
+
+@app.get("/api/pinecone_slack_upload_batch/tick")
+@require_solari_key
+def pinecone_slack_upload_batch_tick():
+    uid = request.args.get("uid")
+    agent_id = request.args.get("agent_id")
+    batch_id = request.args.get("batch_id")
+
+    if not uid or not agent_id or not batch_id:
+        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_batch_id"}), 400
+
+    try:
+        team_user_ref, team_id_solari = get_team_user_ref(db, uid)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    batch_ref = (
+        team_user_ref.collection("agents").document(agent_id)
+          .collection("slack_pinecone_batches").document(batch_id)
+    )
+
+    now_unix = int(time.time())
+
+    @firestore.transactional
+    def claim_work(txn: firestore.Transaction):
+        snap = batch_ref.get(transaction=txn)
+        if not snap.exists:
+            return {"ok": False, "error": "batch_not_found"}
+
+        doc = snap.to_dict() or {}
+        status = doc.get("status")
+        if status not in ("running",):
+            return {"ok": False, "error": "batch_not_running", "status": status}
+
+        queue = doc.get("queue", []) or []
+        cursor = int(doc.get("cursor", 0) or 0)
+
+        if cursor >= len(queue):
+            txn.update(batch_ref, {
+                "status": "done",
+                "finished_at_unix": doc.get("finished_at_unix") or now_unix,
+                "last_tick_at_unix": now_unix,
+            })
+            return {"ok": True, "done": True, "doc": doc}
+
+        item = queue[cursor] or {}
+        if item.get("status") in ("done", "error", "skipped"):
+            txn.update(batch_ref, {
+                "cursor": cursor + 1,
+                "last_tick_at_unix": now_unix,
+            })
+            return {"ok": True, "skipped_cursor_advance": True, "doc": doc}
+
+        item["status"] = "running"
+        item["started_at_unix"] = now_unix
+        queue[cursor] = item
+
+        txn.update(batch_ref, {
+            "queue": queue,
+            "last_tick_at_unix": now_unix,
+        })
+
+        return {
+            "ok": True,
+            "done": False,
+            "cursor": cursor,
+            "item": item,
+            "doc": doc,
+        }
+
+    txn = db.transaction()
+    claim = claim_work(txn)
+
+    if not claim.get("ok"):
+        return jsonify(claim), (404 if claim.get("error") == "batch_not_found" else 400)
+
+    if claim.get("done"):
+        doc = claim.get("doc") or {}
+        return jsonify({
+            "ok": True,
+            "batch_id": batch_id,
+            "status": "done",
+            "total": doc.get("total", 0),
+            "completed": doc.get("completed", 0),
+            "failed": doc.get("failed", 0),
+        })
+
+    if claim.get("skipped_cursor_advance"):
+        doc = claim.get("doc") or {}
+        return jsonify({
+            "ok": True,
+            "batch_id": batch_id,
+            "status": doc.get("status"),
+            "cursor": doc.get("cursor", 0),
+            "total": doc.get("total", 0),
+        })
+
+    item = claim.get("item") or {}
+    cursor = claim.get("cursor", 0)
+    namespace = (claim.get("doc") or {}).get("namespace")
+    chunk_n = int((claim.get("doc") or {}).get("chunk_n", 20))
+    overlap_n = int((claim.get("doc") or {}).get("overlap_n", 5))
+
+    channel_id = item.get("channel_id")
+    channel_name = item.get("channel_name")
+    nickname = item.get("nickname") or ""
+
+    result = pinecone_slack_upload_internal(
+        db=db,
+        uid=uid,
+        agent_id=agent_id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        namespace=namespace,
+        nickname=nickname,
+        chunk_n=chunk_n,
+        overlap_n=overlap_n,
+        team_id=None,
+        source_id=channel_id,
+    )
+
+    queue_updates = {}
+    status = "done" if result.get("ok") else "error"
+    queue_updates["status"] = status
+    queue_updates["finished_at_unix"] = int(time.time())
+    queue_updates["result"] = result if result.get("ok") else None
+    queue_updates["error"] = None if result.get("ok") else result.get("error")
+
+    @firestore.transactional
+    def finish_work(txn: firestore.Transaction):
+        snap = batch_ref.get(transaction=txn)
+        if not snap.exists:
+            return {"ok": False, "error": "batch_not_found"}
+
+        doc = snap.to_dict() or {}
+        queue = doc.get("queue", []) or []
+        if cursor >= len(queue):
+            return {"ok": False, "error": "cursor_out_of_range"}
+
+        queue[cursor] = {**queue[cursor], **queue_updates}
+        completed = int(doc.get("completed", 0) or 0)
+        failed = int(doc.get("failed", 0) or 0)
+        if status == "done":
+            completed += 1
+        else:
+            failed += 1
+
+        txn.update(batch_ref, {
+            "queue": queue,
+            "cursor": cursor + 1,
+            "completed": completed,
+            "failed": failed,
+            "last_tick_at_unix": int(time.time()),
+        })
+        return {"ok": True}
+
+    finish_result = finish_work(db.transaction())
+    if not finish_result.get("ok"):
+        return jsonify(finish_result), 500
+
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "cursor": cursor,
+        "item_status": status,
+        "result": result,
+    })
 
 def analyze_tabular_data(file_content: bytes, file_path: str) -> dict:
     """
@@ -5108,7 +5521,8 @@ SLACK_SCOPES = ",".join([
     "channels:read",
     "commands",
     "groups:history",
-    "groups:read"
+    "groups:read", 
+    "users:read"
 ])
 
 def get_team_id_for_uid(db, uid: str) -> str:
@@ -5442,6 +5856,28 @@ def slack_get(bot_token: str, method: str, params: dict) -> dict:
         raise RuntimeError(resp)
     return resp
 
+def slack_get_user_name(bot_token: str, user_id: str, cache: dict[str, str]) -> str:
+    if not user_id:
+        return "unknown"
+    if user_id in cache:
+        return cache[user_id]
+
+    try:
+        data = slack_get(bot_token, "users.info", {"user": user_id})
+    except Exception:
+        cache[user_id] = user_id
+        return user_id
+
+    user = data.get("user") or {}
+    profile = user.get("profile") or {}
+    display_name = (profile.get("display_name") or "").strip()
+    real_name = (profile.get("real_name") or "").strip()
+    name = (user.get("name") or "").strip()
+
+    resolved = display_name or real_name or name or user_id
+    cache[user_id] = resolved
+    return resolved
+
 def get_bot_token_for_uid(db, uid: str, team_id: str | None = None) -> tuple[str, str]:
     installs_ref, _ = get_slack_installations_ref(db, uid)
 
@@ -5461,6 +5897,277 @@ def get_bot_token_for_uid(db, uid: str, team_id: str | None = None) -> tuple[str
 def slack_message_permalink(team_id: str, channel_id: str, message_ts: str) -> str:
     # Slack deep link that opens the channel/message in Slack
     return f"https://slack.com/app_redirect?team={team_id}&channel={channel_id}&message_ts={message_ts}"
+
+def flatten_slack_transcript(transcript: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Flattens a Slack transcript object into a clean, chronological list of messages.
+
+    Expected input shape:
+    - Either the full wrapper containing `threads_json`
+    - Or a raw `threads_json` object
+    """
+    threads_json = transcript.get("threads_json") if "threads_json" in transcript else transcript
+    threads = threads_json.get("threads", []) or []
+
+    messages: List[Dict[str, Any]] = []
+
+    for thread in threads:
+        thread_ts = thread.get("thread_ts")
+
+        for msg in thread.get("messages", []) or []:
+            text = (msg.get("text") or "").strip()
+            ts = msg.get("ts")
+
+            if not text or not ts:
+                continue
+
+            messages.append({
+                "ts": ts,
+                "thread_ts": thread_ts,
+                "user_id": msg.get("user"),
+                "user_name": msg.get("user_name") or msg.get("username"),
+                "text": text,
+                "permalink": msg.get("permalink"),
+                "is_reply": bool(msg.get("is_reply", False)),
+            })
+
+    try:
+        messages.sort(key=lambda m: float(m["ts"]))
+    except Exception:
+        pass
+
+    return messages
+
+def chunk_messages(
+    messages: List[Dict[str, Any]],
+    chunk_n: int = 20,
+    overlap_n: int = 5
+) -> List[List[Dict[str, Any]]]:
+    """
+    Chunk a list of messages into overlapping windows.
+    """
+    if chunk_n <= 0:
+        raise ValueError("chunk_n must be > 0")
+    if overlap_n >= chunk_n:
+        raise ValueError("overlap_n must be < chunk_n")
+
+    chunks: List[List[Dict[str, Any]]] = []
+    i = 0
+
+    while i < len(messages):
+        chunk = messages[i:i + chunk_n]
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        i += chunk_n - overlap_n
+
+    return chunks
+
+def load_latest_slack_transcript_chunk(db, uid: str, agent_id: str, source_id: str) -> Dict[str, Any]:
+    team_user_ref, team_id_solari = get_team_user_ref(db, uid)
+
+    source_ref = (
+        db.collection("teams").document(team_id_solari)
+          .collection("agents").document(agent_id)
+          .collection("sources").document(source_id)
+    )
+    if not source_ref.get().exists:
+        raise KeyError("source_not_found")
+
+    chunks_ref = source_ref.collection("transcript_chunks")
+
+    def query_by_last_message_ts():
+        q = chunks_ref.order_by("last_message_ts", direction=firestore.Query.DESCENDING)
+        return list(q.limit(1).stream())
+
+    def query_by_created_at_fallback():
+        q = chunks_ref.order_by("created_at", direction=firestore.Query.DESCENDING)
+        return list(q.limit(1).stream())
+
+    try:
+        chunk_snaps = query_by_last_message_ts()
+    except Exception:
+        chunk_snaps = query_by_created_at_fallback()
+
+    if not chunk_snaps:
+        raise KeyError("no_transcript_chunks_found")
+
+    chunk = chunk_snaps[0].to_dict() or {}
+    storage_path = chunk.get("storage_path_threads")
+    if not storage_path:
+        raise KeyError("missing_storage_path_threads")
+
+    bucket = storage.bucket()
+    blob = bucket.blob(storage_path)
+    raw = blob.download_as_text(encoding="utf-8")
+    threads_json = json.loads(raw)
+
+    return {
+        "team_id_solari": team_id_solari,
+        "storage_path_threads": storage_path,
+        "chunk": chunk,
+        "threads_json": threads_json,
+    }
+
+def pinecone_slack_upload_internal(
+    db,
+    uid: str,
+    agent_id: str,
+    channel_id: str,
+    channel_name: Optional[str],
+    namespace: str,
+    nickname: str = "",
+    chunk_n: int = 20,
+    overlap_n: int = 5,
+    team_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not channel_id or not namespace:
+        return {"ok": False, "error": "missing_channel_id_or_namespace"}
+
+    if not channel_name:
+        try:
+            team_user_ref, team_id_solari = get_team_user_ref(db, uid)
+            source_ref = (
+                db.collection("teams").document(team_id_solari)
+                  .collection("agents").document(agent_id)
+                  .collection("sources").document(channel_id)
+            )
+            source_doc = source_ref.get()
+            if source_doc.exists:
+                channel_name = (source_doc.to_dict() or {}).get("name")
+        except KeyError:
+            channel_name = None
+
+    if not channel_name:
+        return {"ok": False, "error": "channel_name_required"}
+
+    sync_result = _sync_channel_transcript_internal(
+        uid=uid,
+        agent_id=agent_id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        team_id=team_id,
+    )
+    if not sync_result.get("ok"):
+        return {"ok": False, "error": sync_result.get("error"), "details": sync_result}
+
+    if nickname:
+        try:
+            team_user_ref, team_id_solari = get_team_user_ref(db, uid)
+            source_ref = (
+                db.collection("teams").document(team_id_solari)
+                  .collection("agents").document(agent_id)
+                  .collection("sources").document(channel_id)
+            )
+            source_ref.set({"nickname": nickname}, merge=True)
+        except Exception as e:
+            logger.warning(f"Failed to update slack source nickname: {str(e)}")
+
+    transcript_payload = load_latest_slack_transcript_chunk(db, uid, agent_id, channel_id)
+    threads_json = transcript_payload.get("threads_json") or {}
+    chunk_meta = transcript_payload.get("chunk") or {}
+    storage_path_threads = transcript_payload.get("storage_path_threads")
+
+    channel_id = threads_json.get("channel_id") or channel_id
+    channel_name = threads_json.get("channel_name") or channel_name or ""
+    team_id_used = threads_json.get("team_id") or chunk_meta.get("team_id")
+    sync_run_id = threads_json.get("sync_run_id") or chunk_meta.get("sync_run_id")
+
+    messages = flatten_slack_transcript(threads_json)
+    if not messages:
+        return {"ok": False, "error": "no_messages_to_upload"}
+
+    chunks = chunk_messages(messages, chunk_n=chunk_n, overlap_n=overlap_n)
+
+    chunk_texts: List[str] = []
+    chunk_metadatas: List[Dict[str, Any]] = []
+
+    base_id_raw = f"slack_{team_id_used}_{channel_id}_{sync_run_id}"
+    base_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in base_id_raw)
+    resolved_source_id = source_id or channel_id
+
+    for idx, chunk in enumerate(chunks):
+        lines = [f"#channel: #{channel_name} ({channel_id})"]
+        thread_ts_values = []
+        ts_values = []
+
+        for msg in chunk:
+            ts = msg.get("ts")
+            if ts:
+                ts_values.append(float(ts))
+
+            thread_ts = msg.get("thread_ts")
+            if thread_ts:
+                thread_ts_values.append(thread_ts)
+
+            user_name = (msg.get("user_name") or msg.get("user_id") or "unknown").strip() or "unknown"
+            text = msg.get("text") or ""
+            prefix = "↳ " if msg.get("is_reply") else ""
+            lines.append(f"{prefix}[{ts}] @{user_name}: {text}")
+
+        min_ts = str(min(ts_values)) if ts_values else ""
+        max_ts = str(max(ts_values)) if ts_values else ""
+        thread_ts_list = sorted(set(thread_ts_values)) if thread_ts_values else []
+
+        chunk_text = "\n".join(lines)
+        chunk_texts.append(chunk_text)
+
+        metadata = {
+            "source": "slack",
+            "uid": uid,
+            "agent_id": agent_id,
+            "source_id": resolved_source_id,
+            "team_id": team_id_used,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "sync_run_id": sync_run_id,
+            "chunk_index": idx,
+            "message_count": len(chunk),
+            "thread_ts_list": thread_ts_list,
+            "text_preview": chunk_text[:500],
+            "storage_path_threads": storage_path_threads,
+            "nickname": nickname,
+        }
+        if min_ts:
+            metadata["min_ts"] = min_ts
+        if max_ts:
+            metadata["max_ts"] = max_ts
+
+        chunk_metadatas.append(metadata)
+
+    openai_client = get_openai_client()
+    embeddings = generate_embeddings(chunk_texts, openai_client)
+
+    vectors = []
+    for i, (embedding, metadata) in enumerate(zip(embeddings, chunk_metadatas)):
+        vectors.append({
+            "id": f"{base_id}_chunk_{i}",
+            "values": embedding,
+            "metadata": metadata,
+        })
+
+    index_name = "production"
+    total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+
+    return {
+        "ok": True,
+        "namespace": namespace,
+        "index": index_name,
+        "uid": uid,
+        "agent_id": agent_id,
+        "source_id": resolved_source_id,
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "sync_run_id": sync_run_id,
+        "messages_processed": len(messages),
+        "chunks_created": len(chunks),
+        "vectors_uploaded": total_uploaded,
+        "chunk_n": chunk_n,
+        "overlap_n": overlap_n,
+        "nickname": nickname,
+    }
 
 # --- endpoint ---
 
@@ -5523,7 +6230,7 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
             params = {"channel": channel_id, "limit": min(200, limit - len(history_messages))}
             if oldest:
                 params["oldest"] = oldest
-                params["inclusive"] = False
+                params["inclusive"] = True
             if cursor:
                 params["cursor"] = cursor
 
@@ -5557,6 +6264,14 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
 
         cleaned.sort(key=lambda m: float(m.get("ts", "0")))
 
+        # 3.5) Resolve Slack user IDs to display names (cached per sync run)
+        user_name_cache: dict[str, str] = {}
+        for m in cleaned:
+            user_id = m.get("user") or ""
+            if not user_id:
+                continue
+            m["user_name"] = slack_get_user_name(bot_token, user_id, user_name_cache)
+
         # 4) Identify threads to refresh (Level 2 via latest_reply vs map)
         threads_to_refresh = []
         for m in cleaned:
@@ -5582,7 +6297,7 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
             params = {"channel": channel_id, "ts": tts, "limit": 200}
             if prev_latest:
                 params["oldest"] = prev_latest
-                params["inclusive"] = False
+                params["inclusive"] = True
 
             replies_by_thread_ts[tts] = slack_get(bot_token, "conversations.replies", params)
 
@@ -5599,6 +6314,7 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
                 max_ts_seen = max(max_ts_seen, float(ts_val))
 
             user = m.get("user") or "unknown"
+            user_name = m.get("user_name") or user
             text = (m.get("text") or "").strip()
 
             thread_ts = m.get("thread_ts")
@@ -5611,13 +6327,14 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
                 root_msg_obj = {
                     "ts": ts_val,
                     "user": user,
+                    "user_name": user_name,
                     "text": text,
                     "is_reply": False,
                     "permalink": slack_message_permalink(team_id_used, channel_id, ts_val),
                 }
                 thread_msgs = [root_msg_obj]
 
-                transcript_lines.append(f"[{slack_ts_to_str(ts_val, tz)}] @{user}: {text}")
+                transcript_lines.append(f"[{slack_ts_to_str(ts_val, tz)}] @{user_name}: {text}")
 
                 # track latest reply for metadata
                 if latest_reply:
@@ -5642,17 +6359,19 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
                         max_ts_seen = max(max_ts_seen, float(r_ts))
                         r_user = r.get("user") or "unknown"
                         r_text = (r.get("text") or "").strip()
+                        r_user_name = slack_get_user_name(bot_token, r_user, user_name_cache)
 
                         thread_msgs.append({
                             "ts": r_ts,
                             "user": r_user,
+                            "user_name": r_user_name,
                             "text": r_text,
                             "is_reply": True,
                             "permalink": slack_message_permalink(team_id_used, channel_id, r_ts),
                         })
 
                         transcript_lines.append(
-                            f"  ↳ [{slack_ts_to_str(r_ts, tz)}] @{r_user}: {r_text}"
+                            f"  ↳ [{slack_ts_to_str(r_ts, tz)}] @{r_user_name}: {r_text}"
                         )
 
                 transcript_lines.append("")
@@ -5663,7 +6382,7 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
                 if thread_ts and ts_val and thread_ts != ts_val:
                     continue  # skip non-root reply entries if any appear
 
-                transcript_lines.append(f"[{slack_ts_to_str(ts_val, tz)}] @{user}: {text}")
+                transcript_lines.append(f"[{slack_ts_to_str(ts_val, tz)}] @{user_name}: {text}")
                 transcript_lines.append("")
 
                 threads_out.append({
@@ -5671,6 +6390,7 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
                     "messages": [{
                         "ts": ts_val,
                         "user": user,
+                        "user_name": user_name,
                         "text": text,
                         "is_reply": False,
                         "permalink": slack_message_permalink(team_id_used, channel_id, ts_val),
