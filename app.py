@@ -30,6 +30,8 @@ import requests
 import secrets
 import uuid
 from zoneinfo import ZoneInfo
+from bs4 import BeautifulSoup, NavigableString, Tag
+import html
 
 # from typing import List
 # Load environment variables from .env file
@@ -821,6 +823,100 @@ def _get_jira_creds(user_id: str):
         "site_url": user_data.get("jira_site_url")
     }
 
+def _merge_jira_tickets(existing_tickets: list, new_tickets: list) -> list:
+    """
+    Merge Jira tickets by key/id, preferring new ticket data.
+    Preserves existing order, then appends new tickets.
+    """
+    merged = {}
+    for ticket in existing_tickets or []:
+        if not isinstance(ticket, dict):
+            continue
+        ticket_key = ticket.get("key") or ticket.get("id")
+        if ticket_key:
+            merged[ticket_key] = ticket
+    for ticket in new_tickets or []:
+        if not isinstance(ticket, dict):
+            continue
+        ticket_key = ticket.get("key") or ticket.get("id")
+        if ticket_key:
+            merged[ticket_key] = ticket
+    return list(merged.values())
+
+def _build_jira_ticket_text(ticket: dict) -> str:
+    ticket_id = ticket.get("id")
+    assignee = ticket.get("assignee") or {}
+    issuetype = ticket.get("issuetype")
+    ticket_key = ticket.get("key")
+    project = ticket.get("project") or {}
+    status = ticket.get("status")
+    summary = ticket.get("summary")
+
+    assignee_name = assignee.get("displayName") if isinstance(assignee, dict) else None
+    project_key = project.get("key") if isinstance(project, dict) else None
+    project_name = project.get("name") if isinstance(project, dict) else None
+
+    lines = [
+        f"jira ticket id: {ticket_id or ''}".strip(),
+        f"assigned: {assignee_name or ''}".strip(),
+        f"issuetype: {issuetype or ''}".strip(),
+        f"key: {ticket_key or ''}".strip(),
+        f"project key: {project_key or ''}".strip(),
+        f"project name: {project_name or ''}".strip(),
+        f"status: {status or ''}".strip(),
+        f"summary: {summary or ''}".strip(),
+    ]
+
+    return "\n".join(lines).strip()
+
+def _remove_jira_ticket_by_id(existing_tickets: list, jira_id: str) -> list:
+    if not existing_tickets:
+        return []
+    return [
+        ticket for ticket in existing_tickets
+        if isinstance(ticket, dict) and str(ticket.get("id")) != str(jira_id)
+    ]
+
+def _get_team_pinecone_namespace(db, team_id: str) -> str:
+    team_doc = db.collection("teams").document(team_id).get()
+    if not team_doc.exists:
+        raise KeyError("team_not_found")
+    namespace = (team_doc.to_dict() or {}).get("pinecone_namespace")
+    if not namespace:
+        raise KeyError("pinecone_namespace_not_found")
+    return namespace
+
+def _delete_firestore_document_recursive(doc_ref) -> None:
+    """
+    Recursively delete a Firestore document and all nested subcollections.
+    """
+    for subcol in doc_ref.collections():
+        for subdoc in subcol.stream():
+            _delete_firestore_document_recursive(subdoc.reference)
+    doc_ref.delete()
+
+def _fetch_confluence_page_storage_body(user_id: str, page_id: str, base_url: str, solari_key: Optional[str]) -> str:
+    """
+    Fetch Confluence page body in storage format by calling the internal /api/confluence/get-page endpoint.
+    Returns the body.storage.value string (or empty string if missing).
+    """
+    url = f"{base_url}/api/confluence/get-page"
+    headers = {"Accept": "application/json"}
+    if solari_key:
+        headers["x-solari-key"] = solari_key
+    params = {
+        "user_id": user_id,
+        "page_id": page_id,
+        "body_format": "storage",
+    }
+
+    response = requests.get(url, headers=headers, params=params, timeout=10)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch Confluence page body: {response.text}")
+    page_data = (response.json() or {}).get("page") or {}
+    body = (page_data.get("body") or {}).get("storage") or {}
+    return body.get("value") or ""
+
 def _jira_request(user_id: str, method: str, endpoint: str, params: dict = None, json_body: dict = None):
     """
     Make an authenticated request to Jira API.
@@ -1140,6 +1236,225 @@ def jira_get_workspaces():
             "status": "failure",
             "error": str(e)
         }), 500
+
+@app.route("/api/jira/add_ticket", methods=["POST"])
+@require_solari_key
+def jira_add_ticket():
+    """
+    Add Jira tickets as a source for both agent and team scopes.
+    
+    Request Body:
+    {
+      "user_id": "firebase_uid",
+      "agent_id": "agent_id",
+      "tickets": [ { ...ticket fields... } ]
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        user_id = body.get("user_id")
+        agent_id = body.get("agent_id")
+        tickets = body.get("tickets")
+        
+        if not user_id:
+            return jsonify({"status": "failure", "error": "user_id is required"}), 400
+        if not agent_id:
+            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+        if not isinstance(tickets, list) or not tickets:
+            return jsonify({"status": "failure", "error": "tickets must be a non-empty list"}), 400
+        
+        for ticket in tickets:
+            if not isinstance(ticket, dict):
+                return jsonify({"status": "failure", "error": "each ticket must be an object"}), 400
+            if not ticket.get("id"):
+                return jsonify({"status": "failure", "error": "each ticket must include id"}), 400
+        
+        db = firestore.client()
+        team_id = get_team_id_for_uid(db, user_id)
+        namespace = _get_team_pinecone_namespace(db, team_id)
+        
+        # --- Agent-level Jira source ---
+        agent_sources_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("sources")
+        )
+        agent_jira_docs = agent_sources_ref.where("type", "==", "jira").stream()
+        agent_jira_doc = next(agent_jira_docs, None)
+        
+        if agent_jira_doc:
+            existing_agent_tickets = (agent_jira_doc.to_dict() or {}).get("tickets", [])
+            merged_tickets = _merge_jira_tickets(existing_agent_tickets, tickets)
+            agent_sources_ref.document(agent_jira_doc.id).update({
+                "nickname": "jira",
+                "tickets": merged_tickets,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+        else:
+            agent_sources_ref.add({
+                "type": "jira",
+                "nickname": "jira",
+                "agent_id": agent_id,
+                "tickets": tickets,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+        
+        # --- Team-level Jira source ---
+        team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+        team_jira_docs = team_sources_ref.where("type", "==", "jira").stream()
+        team_jira_doc = next(team_jira_docs, None)
+        
+        if team_jira_doc:
+            existing_team_tickets = (team_jira_doc.to_dict() or {}).get("tickets", [])
+            merged_tickets = _merge_jira_tickets(existing_team_tickets, tickets)
+            team_sources_ref.document(team_jira_doc.id).update({
+                "nickname": "jira",
+                "tickets": merged_tickets,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+        else:
+            team_sources_ref.add({
+                "type": "jira",
+                "nickname": "jira",
+                "tickets": tickets,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+        
+        ticket_texts = []
+        ticket_metadatas = []
+        vector_ids = []
+        for ticket in tickets:
+            ticket_id = str(ticket.get("id"))
+            text = _build_jira_ticket_text(ticket)
+            if not text:
+                text = f"Jira Ticket ID {ticket_id}"
+            ticket_texts.append(text)
+            ticket_metadatas.append({
+                "nickname": "jira",
+                "source": "jira",
+                "jira_id": ticket_id,
+                "text_preview": text,
+            })
+            raw_id = f"jira_{team_id}_{ticket_id}"
+            safe_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in raw_id)
+            vector_ids.append(safe_id)
+
+        openai_client = get_openai_client()
+        embeddings = generate_embeddings(ticket_texts, openai_client)
+
+        vectors = []
+        for embedding, metadata, vector_id in zip(embeddings, ticket_metadatas, vector_ids):
+            vectors.append({
+                "id": vector_id,
+                "values": embedding,
+                "metadata": metadata,
+            })
+
+        index_name = "production"
+        total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+
+        return jsonify({
+            "status": "success",
+            "vectors_uploaded": total_uploaded,
+            "namespace": namespace,
+            "index": index_name,
+        }), 200
+    
+    except KeyError as e:
+        logger.error(f"Jira add ticket error: {str(e)}")
+        return jsonify({"status": "failure", "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Jira add ticket error: {str(e)}", exc_info=True)
+        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
+
+@app.route("/api/jira/delete_ticket", methods=["POST"])
+@require_solari_key
+def jira_delete_ticket():
+    """
+    Delete a Jira ticket from both Firestore sources and Pinecone.
+    
+    Request Body:
+    {
+      "user_id": "firebase_uid",
+      "agent_id": "agent_id",
+      "jira_id": "10001",
+      "namespace": "your-namespace"
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        user_id = body.get("user_id")
+        agent_id = body.get("agent_id")
+        jira_id = body.get("jira_id")
+        
+        if not user_id:
+            return jsonify({"status": "failure", "error": "user_id is required"}), 400
+        if not agent_id:
+            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+        if not jira_id:
+            return jsonify({"status": "failure", "error": "jira_id is required"}), 400
+        
+        db = firestore.client()
+        team_id = get_team_id_for_uid(db, user_id)
+        namespace = _get_team_pinecone_namespace(db, team_id)
+        
+        removed_agent = False
+        removed_team = False
+        
+        # --- Agent-level Jira source ---
+        agent_sources_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("sources")
+        )
+        agent_jira_docs = agent_sources_ref.where("type", "==", "jira").stream()
+        agent_jira_doc = next(agent_jira_docs, None)
+        if agent_jira_doc:
+            agent_data = agent_jira_doc.to_dict() or {}
+            updated_tickets = _remove_jira_ticket_by_id(agent_data.get("tickets", []), jira_id)
+            if len(updated_tickets) != len(agent_data.get("tickets", [])):
+                removed_agent = True
+            agent_sources_ref.document(agent_jira_doc.id).update({
+                "tickets": updated_tickets,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+        
+        # --- Team-level Jira source ---
+        team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+        team_jira_docs = team_sources_ref.where("type", "==", "jira").stream()
+        team_jira_doc = next(team_jira_docs, None)
+        if team_jira_doc:
+            team_data = team_jira_doc.to_dict() or {}
+            updated_tickets = _remove_jira_ticket_by_id(team_data.get("tickets", []), jira_id)
+            if len(updated_tickets) != len(team_data.get("tickets", [])):
+                removed_team = True
+            team_sources_ref.document(team_jira_doc.id).update({
+                "tickets": updated_tickets,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
+        
+        # --- Pinecone delete ---
+        raw_id = f"jira_{team_id}_{jira_id}"
+        vector_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in raw_id)
+        pc = get_pinecone_client()
+        index = pc.Index("production")
+        index.delete(ids=[vector_id], namespace=namespace)
+        
+        return jsonify({
+            "status": "success",
+            "removed_agent": removed_agent,
+            "removed_team": removed_team,
+            "deleted_vector_id": vector_id,
+        }), 200
+    
+    except KeyError as e:
+        logger.error(f"Jira delete ticket error: {str(e)}")
+        return jsonify({"status": "failure", "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Jira delete ticket error: {str(e)}", exc_info=True)
+        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
 
 @app.route('/api/firebase/test', methods=['GET'])
 @require_solari_key
@@ -1549,6 +1864,81 @@ def list_agent_members():
     except Exception as e:
         logger.error(f"Error in list_agent_members: {str(e)}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/agent/delete', methods=['POST'])
+@require_solari_key
+def delete_agent():
+    """
+    Delete an agent (and all subcollections) if user has admin permissions.
+    
+    Request Body:
+    {
+      "user_id": "firebase_uid",
+      "agent_id": "agent_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "status": "failure",
+                "reason": "missing_user_id_or_agent_id"
+            }), 400
+
+        db = firestore.client()
+        team_id = get_team_id_for_uid(db, user_id)
+
+        team_user_ref = db.collection("teams").document(team_id).collection("users").document(user_id)
+        team_user_snap = team_user_ref.get()
+        if not team_user_snap.exists:
+            return jsonify({
+                "status": "failure",
+                "reason": "team_user_not_found"
+            }), 404
+
+        team_role = (team_user_snap.to_dict() or {}).get("role")
+        if team_role == "admin":
+            has_permission = True
+            permission_used = "team_admin"
+        else:
+            member_ref = (
+                db.collection("teams").document(team_id)
+                  .collection("agents").document(agent_id)
+                  .collection("agent-members").document(user_id)
+            )
+            member_snap = member_ref.get()
+            member_role = (member_snap.to_dict() or {}).get("role") if member_snap.exists else None
+            has_permission = member_role == "admin"
+            permission_used = member_role or "none"
+
+        if not has_permission:
+            return jsonify({
+                "status": "failure",
+                "reason": f"permission error {permission_used}"
+            }), 403
+
+        agent_ref = db.collection("teams").document(team_id).collection("agents").document(agent_id)
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({
+                "status": "failure",
+                "reason": "agent_not_found"
+            }), 404
+
+        agent_name = (agent_snap.to_dict() or {}).get("name") or ""
+        _delete_firestore_document_recursive(agent_ref)
+
+        return jsonify({
+            "status": "success",
+            "agent_deleted": agent_name
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in delete_agent: {str(e)}", exc_info=True)
+        return jsonify({"status": "failure", "reason": str(e)}), 500
 
 @app.route('/api/pinecone_doc_upload', methods=['POST'])
 @require_solari_key
@@ -5477,10 +5867,10 @@ def confluence_get_full_page():
             "Accept": "application/json"
         }
         
-        # Add body_format as query parameter if provided
+        # Add body-format (Confluence v2 expects hyphenated param)
         params = {}
         if body_format:
-            params["body_format"] = body_format
+            params["body-format"] = body_format
         
         response = requests.get(url, headers=headers, params=params, timeout=10)
         
@@ -5504,6 +5894,579 @@ def confluence_get_full_page():
             "status": "failure",
             "error": str(e)
         }), 500
+
+def confluence_storage_html_to_rag_text(storage_html: str) -> str:
+    """
+    Convert Confluence 'storage' HTML into readable, RAG-friendly plaintext.
+    Preserves headings, lists, tables. Removes noisy attributes.
+    """
+    if not storage_html or not storage_html.strip():
+        return ""
+
+    storage_html = html.unescape(storage_html)  # decode &ndash; etc.
+    soup = BeautifulSoup(storage_html, "html.parser")
+
+    # Remove noisy attributes (local-id, data-*, ac:*)
+    for tag in soup.find_all(True):
+        for attr in list(tag.attrs.keys()):
+            if attr in ("href", "src"):
+                continue
+            if attr == "local-id" or attr.endswith("local-id") or attr.startswith("data-") or ":" in attr:
+                tag.attrs.pop(attr, None)
+
+    # Replace <br> with newline
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+
+    lines: List[str] = []
+
+    def add_line(s: str):
+        s = s.strip()
+        if s:
+            lines.append(s)
+
+    def render_node(node):
+        if isinstance(node, NavigableString):
+            txt = str(node).strip()
+            if txt:
+                add_line(txt)
+            return
+
+        if not isinstance(node, Tag):
+            return
+
+        name = node.name.lower()
+
+        if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(name[1])
+            text = node.get_text(" ", strip=True)
+            add_line("#" * level + " " + text)
+            add_line("")
+            return
+
+        if name == "hr":
+            add_line("---")
+            add_line("")
+            return
+
+        if name == "p":
+            text = node.get_text(" ", strip=True)
+            add_line(text)
+            add_line("")
+            return
+
+        if name == "ul":
+            for li in node.find_all("li", recursive=False):
+                text = li.get_text(" ", strip=True)
+                if text:
+                    add_line(f"- {text}")
+            add_line("")
+            return
+
+        if name == "ol":
+            idx = int(node.get("start") or 1)
+            for li in node.find_all("li", recursive=False):
+                text = li.get_text(" ", strip=True)
+                if text:
+                    add_line(f"{idx}. {text}")
+                    idx += 1
+            add_line("")
+            return
+
+        if name == "table":
+            rows = []
+            for tr in node.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                if any(cells):
+                    rows.append(cells)
+
+            if rows:
+                max_cols = max(len(r) for r in rows)
+                rows = [r + [""] * (max_cols - len(r)) for r in rows]
+
+                header = rows[0]
+                add_line("| " + " | ".join(header) + " |")
+                add_line("| " + " | ".join(["---"] * max_cols) + " |")
+                for r in rows[1:]:
+                    add_line("| " + " | ".join(r) + " |")
+                add_line("")
+            return
+
+        for child in node.children:
+            render_node(child)
+
+    render_node(soup)
+
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def upload_string_to_firebase_storage(storage_path: str, content: str, content_type: str = "text/plain") -> str:
+    """
+    Uploads a string to Firebase Storage at `storage_path`.
+    Returns a gs:// URL (stable, good for storage).
+    """
+    bucket = storage.bucket()
+    blob = bucket.blob(storage_path)
+    blob.upload_from_string(content, content_type=content_type)
+    return f"gs://{bucket.name}/{storage_path}"
+
+
+# -------------------------
+# Updated endpoint
+# -------------------------
+
+@app.route("/api/confluence/add_pages", methods=["POST"])
+@require_solari_key
+def confluence_add_pages():
+    """
+    Add Confluence pages as sources for agent + team scopes, save raw+processed to Storage,
+    and upload processed text to Pinecone (chunked/embedded).
+
+    Request Body:
+    {
+      "user_id": "firebase_uid",
+      "team_id": "team_id",              # optional (derived if missing)
+      "agent_id": "agent_id",
+      "nickname": "confluence",          # optional, default "confluence" for now
+      "pages": [
+        {
+          "id": "327682",
+          "title": "2025-10-07 Meeting notes",
+          "tinyui_path": "/x/AgAF",
+          "excerpt": "optional preview text",
+          "url": "https://.../wiki/x/AgAF"
+        }
+      ],
+      "chunk_size": 1000,                # optional
+      "chunk_overlap": 200               # optional
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+
+        user_id = body.get("user_id")
+        team_id = body.get("team_id") or body.get("teamId")
+        agent_id = body.get("agent_id")
+        pages = body.get("pages")
+
+        chunk_size = int(body.get("chunk_size", 1000))
+        chunk_overlap = int(body.get("chunk_overlap", 200))
+
+        if not user_id:
+            return jsonify({"status": "failure", "error": "user_id is required"}), 400
+        if not agent_id:
+            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+        if not isinstance(pages, list) or not pages:
+            return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
+
+        db = firestore.client()
+        if not team_id:
+            team_id = get_team_id_for_uid(db, user_id)
+        namespace = _get_team_pinecone_namespace(db, team_id)
+
+        agent_sources_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("sources")
+        )
+        team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+
+        openai_client = get_openai_client()
+
+        added = 0
+        pinecone_uploaded_total = 0
+
+        for page in pages:
+            if not isinstance(page, dict):
+                return jsonify({"status": "failure", "error": "each page must be an object"}), 400
+
+            page_id = page.get("id")
+            title = page.get("title")
+            tinyui_path = page.get("tinyui_path")
+            url = page.get("url")
+            body_preview = page.get("excerpt")
+            nickname = title
+
+            if not page_id or not title:
+                return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
+
+            logger.info(f"Adding Confluence page source: id={page_id}, title={title}, url={url}")
+
+            # 1) Fetch Confluence storage HTML via internal endpoint
+            storage_html = ""
+            try:
+                base_url = request.host_url.rstrip("/")
+                solari_key = request.headers.get(SOLARI_KEY_HEADER)
+                storage_html = _fetch_confluence_page_storage_body(user_id, page_id, base_url, solari_key)
+            except Exception as e:
+                logger.warning(f"Failed to fetch Confluence page body for {page_id}: {str(e)}")
+                storage_html = ""
+
+            # 2) Convert to RAG-friendly text
+            processed_text = confluence_storage_html_to_rag_text(storage_html) if storage_html else ""
+
+            # 3) Upsert team-level source doc (and get its Firestore doc id = source_id)
+            team_match = team_sources_ref.where("id", "==", page_id).limit(1).stream()
+            team_doc = next(team_match, None)
+
+            if team_doc:
+                team_source_id = team_doc.id
+                team_sources_ref.document(team_source_id).update({
+                    "title": title,
+                    "id": page_id,
+                    "tinyui_path": tinyui_path,
+                    "url": url,
+                    "type": "confluence",
+                    "bodyPreview": body_preview,
+                    "nickname": nickname,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "agents": firestore.ArrayUnion([agent_id]),
+                    # NOTE: we no longer store raw html directly in Firestore (too big)
+                })
+            else:
+                new_ref = team_sources_ref.document()  # allocate id so we can use it in storage paths
+                team_source_id = new_ref.id
+                new_ref.set({
+                    "title": title,
+                    "id": page_id,
+                    "tinyui_path": tinyui_path,
+                    "url": url,
+                    "type": "confluence",
+                    "bodyPreview": body_preview,
+                    "nickname": nickname,
+                    "createdAt": firestore.SERVER_TIMESTAMP,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "agents": [agent_id],
+                })
+
+            # 4) Upsert agent-level source doc (still keyed by Confluence page id)
+            agent_match = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
+            agent_doc = next(agent_match, None)
+
+            agent_payload = {
+                "title": title,
+                "id": page_id,
+                "tinyui_path": tinyui_path,
+                "url": url,
+                "type": "confluence_page",
+                "bodyPreview": body_preview,
+                "nickname": nickname,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+
+            if agent_doc:
+                agent_sources_ref.document(agent_doc.id).update(agent_payload)
+            else:
+                agent_payload["createdAt"] = firestore.SERVER_TIMESTAMP
+                agent_sources_ref.add(agent_payload)
+
+            # 5) Save raw + processed to Firebase Storage (under the TEAM source doc)
+            # Paths are deterministic and easy to find later.
+            raw_path = f"teams/{team_id}/sources/{team_source_id}/confluence/pages/{page_id}/raw_storage.html"
+            processed_path = f"teams/{team_id}/sources/{team_source_id}/confluence/pages/{page_id}/processed.txt"
+
+            raw_gs_url = ""
+            processed_gs_url = ""
+
+            if storage_html:
+                raw_gs_url = upload_string_to_firebase_storage(raw_path, storage_html, content_type="text/html")
+
+            if processed_text:
+                processed_gs_url = upload_string_to_firebase_storage(processed_path, processed_text, content_type="text/plain")
+
+            # Save pointers back to Firestore team source doc
+            team_sources_ref.document(team_source_id).update({
+                "title": title,
+                "id": page_id,
+                "tinyui_path": tinyui_path,
+                "url": url,
+                "type": "confluence",
+                "bodyPreview": body_preview,
+                "nickname": nickname,
+                "rawStoragePath": raw_path if storage_html else None,
+                "rawStorageUrl": raw_gs_url if raw_gs_url else None,
+                "processedTextPath": processed_path if processed_text else None,
+                "processedTextUrl": processed_gs_url if processed_gs_url else None,
+                "rawPath": raw_path if storage_html else None,
+                "processedPath": processed_path if processed_text else None,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+
+            # Save pointers to agent source doc as well
+            if agent_doc:
+                agent_doc_id = agent_doc.id
+            else:
+                # If agent doc was just created, it won't have id here; re-query
+                agent_match_latest = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
+                agent_doc_latest = next(agent_match_latest, None)
+                agent_doc_id = agent_doc_latest.id if agent_doc_latest else None
+
+            if agent_doc_id:
+                agent_sources_ref.document(agent_doc_id).update({
+                    "title": title,
+                    "id": page_id,
+                    "tinyui_path": tinyui_path,
+                    "url": url,
+                    "type": "confluence_page",
+                    "bodyPreview": body_preview,
+                    "nickname": nickname,
+                    "rawStoragePath": raw_path if storage_html else None,
+                    "rawStorageUrl": raw_gs_url if raw_gs_url else None,
+                    "processedTextPath": processed_path if processed_text else None,
+                    "processedTextUrl": processed_gs_url if processed_gs_url else None,
+                    "rawPath": raw_path if storage_html else None,
+                    "processedPath": processed_path if processed_text else None,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                })
+
+            # 6) Chunk/embed processed text and upload to Pinecone
+            if processed_text.strip():
+                text_chunks = chunk_text(processed_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                embeddings = generate_embeddings(text_chunks, openai_client)
+
+                vectors = []
+                for i, (chunk, emb) in enumerate(zip(text_chunks, embeddings)):
+                    vectors.append({
+                        "id": f"confluence_{team_source_id}_{page_id}_chunk_{i}",
+                        "values": emb,
+                        "metadata": {
+                            "source": "confluence",
+                            "nickname": nickname,
+                            "confluence_page_id": page_id,
+                            "source_id": team_source_id,  # Firestore doc id (team source doc)
+                            "text_preview": chunk[:500],
+                        }
+                    })
+
+                uploaded = upload_vectors_to_pinecone(
+                    vectors=vectors,
+                    namespace=namespace,
+                    index_name="production",
+                    batch_size=100
+                )
+                pinecone_uploaded_total += uploaded
+            else:
+                logger.info(f"No processed text for Confluence page {page_id}; skipping Pinecone upload.")
+
+            added += 1
+
+        return jsonify({
+            "status": "success",
+            "pages_added": added,
+            "pinecone_vectors_uploaded": pinecone_uploaded_total,
+            "namespace": namespace,
+            "nickname": nickname,
+        }), 200
+
+    except KeyError as e:
+        logger.error(f"Confluence add pages error: {str(e)}")
+        return jsonify({"status": "failure", "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Confluence add pages error: {str(e)}", exc_info=True)
+        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
+
+@app.route("/api/confluence/delete_page", methods=["POST"])
+@require_solari_key
+def confluence_delete_page():
+    """
+    Delete a Confluence page source from Firestore (agent + team) and Pinecone.
+    
+    Request Body:
+    {
+      "user_id": "firebase_uid",
+      "agent_id": "agent_id",
+      "page_id": "327682",
+      "nickname": "2025-10-07 Meeting notes"  # optional, used for Pinecone filter
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        user_id = body.get("user_id")
+        agent_id = body.get("agent_id")
+        page_id = body.get("page_id") or body.get("id")
+        nickname = body.get("nickname")
+        
+        if not user_id:
+            return jsonify({"status": "failure", "error": "user_id is required"}), 400
+        if not agent_id:
+            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+        if not page_id:
+            return jsonify({"status": "failure", "error": "page_id is required"}), 400
+        
+        db = firestore.client()
+        team_id = get_team_id_for_uid(db, user_id)
+        namespace = _get_team_pinecone_namespace(db, team_id)
+        
+        removed_agent = False
+        removed_team = False
+        
+        # --- Agent-level source delete ---
+        agent_sources_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("sources")
+        )
+        agent_match = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
+        agent_doc = next(agent_match, None)
+        if agent_doc:
+            agent_sources_ref.document(agent_doc.id).delete()
+            removed_agent = True
+        
+        # --- Team-level source delete ---
+        team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+        team_match = team_sources_ref.where("id", "==", page_id).limit(1).stream()
+        team_doc = next(team_match, None)
+        if team_doc:
+            team_sources_ref.document(team_doc.id).delete()
+            removed_team = True
+        
+        # --- Pinecone delete ---
+        filter_dict = {"confluence_page_id": {"$eq": page_id}}
+        if nickname:
+            filter_dict["nickname"] = {"$eq": nickname}
+        
+        pc = get_pinecone_client()
+        index = pc.Index("production")
+        index.delete(namespace=namespace, filter=filter_dict)
+        
+        return jsonify({
+            "status": "success",
+            "removed_agent": removed_agent,
+            "removed_team": removed_team,
+            "pinecone_filter": filter_dict,
+        }), 200
+    
+    except KeyError as e:
+        logger.error(f"Confluence delete page error: {str(e)}")
+        return jsonify({"status": "failure", "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Confluence delete page error: {str(e)}", exc_info=True)
+        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
+
+# @app.route("/api/confluence/add_pages", methods=["POST"])
+# @require_solari_key
+# def confluence_add_pages():
+#     """
+#     Add Confluence pages as sources for both agent and team scopes.
+    
+#     Request Body:
+#     {
+#       "user_id": "firebase_uid",
+#       "team_id": "team_id",  # optional (derived from user if missing)
+#       "agent_id": "agent_id",
+#       "pages": [
+#         {
+#           "id": "163945",
+#           "title": "Overview",
+#           "tinyui_path": "/x/aYAC",
+#           "excerpt": "optional preview text",
+#           "url": "https://your-site.atlassian.net/wiki/x/aYAC"
+#         }
+#       ]
+#     }
+#     """
+#     try:
+#         body = request.get_json(force=True) or {}
+#         user_id = body.get("user_id")
+#         team_id = body.get("team_id") or body.get("teamId")
+#         agent_id = body.get("agent_id")
+#         pages = body.get("pages")
+        
+#         if not user_id:
+#             return jsonify({"status": "failure", "error": "user_id is required"}), 400
+#         if not agent_id:
+#             return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+#         if not isinstance(pages, list) or not pages:
+#             return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
+        
+#         db = firestore.client()
+#         if not team_id:
+#             team_id = get_team_id_for_uid(db, user_id)
+        
+#         agent_sources_ref = (
+#             db.collection("teams").document(team_id)
+#               .collection("agents").document(agent_id)
+#               .collection("sources")
+#         )
+#         team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+        
+#         added = 0
+#         for page in pages:
+#             if not isinstance(page, dict):
+#                 return jsonify({"status": "failure", "error": "each page must be an object"}), 400
+            
+#             page_id = page.get("id")
+#             title = page.get("title")
+#             tinyui_path = page.get("tinyui_path")
+#             url = page.get("url")
+#             body_preview = page.get("excerpt")
+            
+#             if not page_id or not title:
+#                 return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
+
+#             logger.info(f"Adding Confluence page source: id={page_id}, title={title}, url={url}")
+
+#             body_storage_value = ""
+#             try:
+#                 body_storage_value = _fetch_confluence_page_storage_body(user_id, page_id)
+#             except Exception as e:
+#                 logger.warning(f"Failed to fetch Confluence page body for {page_id}: {str(e)}")
+            
+#             agent_payload = {
+#                 "title": title,
+#                 "id": page_id,
+#                 "tinyui_path": tinyui_path,
+#                 "url": url,
+#                 "type": "confluence_page",
+#                 "bodyPreview": body_preview,
+#                 "bodyStorage": body_storage_value,
+#                 "updatedAt": firestore.SERVER_TIMESTAMP,
+#             }
+#             team_payload = {
+#                 "title": title,
+#                 "id": page_id,
+#                 "tinyui_path": tinyui_path,
+#                 "url": url,
+#                 "type": "confluence",
+#                 "bodyPreview": body_preview,
+#                 "bodyStorage": body_storage_value,
+#                 "updatedAt": firestore.SERVER_TIMESTAMP,
+#             }
+
+#             # Agent-level source doc (upsert by page id)
+#             agent_match = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
+#             agent_doc = next(agent_match, None)
+#             if agent_doc:
+#                 agent_sources_ref.document(agent_doc.id).update(agent_payload)
+#             else:
+#                 agent_payload["createdAt"] = firestore.SERVER_TIMESTAMP
+#                 agent_sources_ref.add(agent_payload)
+            
+#             # Team-level source doc (upsert by page id)
+#             team_match = team_sources_ref.where("id", "==", page_id).limit(1).stream()
+#             team_doc = next(team_match, None)
+#             if team_doc:
+#                 team_sources_ref.document(team_doc.id).update({
+#                     **team_payload,
+#                     "agents": firestore.ArrayUnion([agent_id]),
+#                 })
+#             else:
+#                 team_payload["agents"] = [agent_id]
+#                 team_payload["createdAt"] = firestore.SERVER_TIMESTAMP
+#                 team_sources_ref.add(team_payload)
+            
+#             added += 1
+        
+#         return jsonify({"status": "success", "pages_added": added}), 200
+    
+#     except KeyError as e:
+#         logger.error(f"Confluence add pages error: {str(e)}")
+#         return jsonify({"status": "failure", "error": str(e)}), 400
+#     except Exception as e:
+#         logger.error(f"Confluence add pages error: {str(e)}", exc_info=True)
+#         return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
 
 
 # SLACK INTEGRATION WORK 
