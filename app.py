@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup, NavigableString, Tag
 import html
 import stripe
+import urllib.parse
 
 # from typing import List
 # Load environment variables from .env file
@@ -880,40 +881,155 @@ def create_portal_session():
 
     return jsonify({"url": session.url}), 200
 
-
+# Booking - calendar route code
 CAL_WEBHOOK_SECRET = os.environ.get("SOLARI_INTERNAL_KEY")  # same internal key you set in Cal
+CAL_EVENT_URL = os.environ.get(
+    "CAL_EVENT_URL",
+    "https://cal.com/sahil-sinha-hugr4z/solari-onboarding"
+)
 
+@app.route("/api/cal/create_appointment", methods=["POST"])
+def cal_create_appointment():
+    """
+    Body:
+      { "user_id": "<firebase_uid>" }
+
+    Behavior:
+      - users/{user_id}.team_id -> team_id
+      - teams/{team_id}.billing.status = "pending_booking"
+      - returns cal_url with metadata[team_id], metadata[user_id]
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    # Look up user -> team_id
+    user_snap = db.collection("users").document(user_id).get()
+    if not user_snap.exists:
+        return jsonify({"error": f"User not found: {user_id}"}), 404
+
+    team_id = (user_snap.to_dict() or {}).get("team_id")
+    if not team_id:
+        return jsonify({"error": f"No team_id found for user {user_id}"}), 400
+
+    # Mark pending booking on team
+    db.collection("teams").document(team_id).set(
+        {
+            "billing": {
+                "access_source": "calendar",
+                "status": "pending_booking",
+                "pending_booking_user_id": user_id,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+        },
+        merge=True,
+    )
+
+    # Build Cal URL with metadata
+    params = {
+        "metadata[team_id]": team_id,
+        "metadata[user_id]": user_id,
+    }
+    cal_url = CAL_EVENT_URL + "?" + urllib.parse.urlencode(params)
+
+    return jsonify({"cal_url": cal_url, "team_id": team_id}), 200
 
 @app.route("/api/webhooks/cal", methods=["POST"])
-def cal_webhook_debug():
-    # --- 1) Verify shared secret (simple + effective) ---
-    # incoming_secret = request.headers.get("X-Cal-Secret")
+def cal_webhook():
+    payload = request.get_json(silent=True) or {}
 
-    # if not incoming_secret or incoming_secret != CAL_WEBHOOK_SECRET:
-    #     print("❌ Invalid or missing Cal webhook secret")
-    #     return jsonify({"error": "unauthorized"}), 401
+    trigger = payload.get("triggerEvent")
+    p = payload.get("payload") or {}
+    metadata = p.get("metadata") or {}
 
-    # --- 2) Log headers ---
-    print("\n====== CAL WEBHOOK HEADERS ======")
-    for k, v in request.headers.items():
-        print(f"{k}: {v}")
+    # Ignore pings/tests
+    if trigger in (None, "PING"):
+        return jsonify({"received": True, "ignored": trigger}), 200
 
-    # --- 3) Log raw body ---
-    raw_body = request.data.decode("utf-8", errors="ignore")
-    print("\n====== CAL WEBHOOK RAW BODY ======")
-    print(raw_body)
+    team_id = metadata.get("team_id")
+    user_id = metadata.get("user_id")
 
-    # --- 4) Try JSON parse (don’t fail if it breaks) ---
-    try:
-        payload = request.get_json(force=True)
-        print("\n====== CAL WEBHOOK PARSED JSON ======")
+    if not team_id or not user_id:
+        # Helpful logging for debugging unexpected payloads
+        print("❌ Cal webhook missing team_id/user_id in payload.metadata")
         print(json.dumps(payload, indent=2))
-    except Exception as e:
-        print("\n⚠️ Failed to parse JSON:", str(e))
-        payload = None
+        return jsonify({"error": "Missing team_id/user_id in payload.metadata"}), 400
 
-    # --- 5) Always ACK ---
-    return jsonify({"received": True}), 200
+    booking_id = p.get("bookingId")
+    booking_status = p.get("status")  # e.g. "ACCEPTED"
+    start_time = p.get("startTime")
+    end_time = p.get("endTime")
+
+    video_url = metadata.get("videoCallUrl") or (p.get("videoCallData") or {}).get("url")
+
+    # ---- Booking created => grant access
+    if trigger == "BOOKING_CREATED":
+        db.collection("teams").document(team_id).set(
+            {
+                "billing": {
+                    "access_source": "calendar",
+                    "status": "booking_confirmed",
+                    "booked_by_user_id": user_id,
+
+                    "cal_booking_id": booking_id,
+                    "cal_booking_status": booking_status,
+                    "cal_start_time": start_time,
+                    "cal_end_time": end_time,
+                    "cal_video_url": video_url,
+
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            },
+            merge=True,
+        )
+        return jsonify({"received": True}), 200
+
+    # ---- Booking cancelled => revoke access until they book again
+    if trigger == "BOOKING_CANCELLED":
+        db.collection("teams").document(team_id).set(
+            {
+                "billing": {
+                    "access_source": "calendar",
+                    "status": "booking_cancelled",
+                    "booked_by_user_id": user_id,
+
+                    "cal_booking_id": booking_id,
+                    "cal_booking_status": booking_status,
+                    "cal_start_time": start_time,
+                    "cal_end_time": end_time,
+
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            },
+            merge=True,
+        )
+        return jsonify({"received": True}), 200
+
+    # Optional: treat reschedule as confirmed (or ignore)
+    if trigger == "BOOKING_RESCHEDULED":
+        db.collection("teams").document(team_id).set(
+            {
+                "billing": {
+                    "access_source": "calendar",
+                    "status": "booking_confirmed",
+                    "booked_by_user_id": user_id,
+
+                    "cal_booking_id": booking_id,
+                    "cal_booking_status": booking_status,
+                    "cal_start_time": start_time,
+                    "cal_end_time": end_time,
+                    "cal_video_url": video_url,
+
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            },
+            merge=True,
+        )
+        return jsonify({"received": True}), 200
+
+    # Ignore other events
+    return jsonify({"received": True, "ignored": trigger}), 200
 
 
 @app.route("/auth/jira/callback", methods=['GET'])
