@@ -881,6 +881,41 @@ def create_portal_session():
     return jsonify({"url": session.url}), 200
 
 
+CAL_WEBHOOK_SECRET = os.environ.get("SOLARI_INTERNAL_KEY")  # same internal key you set in Cal
+
+
+@app.route("/api/webhooks/cal", methods=["POST"])
+def cal_webhook_debug():
+    # --- 1) Verify shared secret (simple + effective) ---
+    incoming_secret = request.headers.get("X-Cal-Secret")
+
+    if not incoming_secret or incoming_secret != CAL_WEBHOOK_SECRET:
+        print("❌ Invalid or missing Cal webhook secret")
+        return jsonify({"error": "unauthorized"}), 401
+
+    # --- 2) Log headers ---
+    print("\n====== CAL WEBHOOK HEADERS ======")
+    for k, v in request.headers.items():
+        print(f"{k}: {v}")
+
+    # --- 3) Log raw body ---
+    raw_body = request.data.decode("utf-8", errors="ignore")
+    print("\n====== CAL WEBHOOK RAW BODY ======")
+    print(raw_body)
+
+    # --- 4) Try JSON parse (don’t fail if it breaks) ---
+    try:
+        payload = request.get_json(force=True)
+        print("\n====== CAL WEBHOOK PARSED JSON ======")
+        print(json.dumps(payload, indent=2))
+    except Exception as e:
+        print("\n⚠️ Failed to parse JSON:", str(e))
+        payload = None
+
+    # --- 5) Always ACK ---
+    return jsonify({"received": True}), 200
+
+
 @app.route("/auth/jira/callback", methods=['GET'])
 def jira_oauth_callback():
     """
