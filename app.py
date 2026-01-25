@@ -887,11 +887,11 @@ CAL_WEBHOOK_SECRET = os.environ.get("SOLARI_INTERNAL_KEY")  # same internal key 
 @app.route("/api/webhooks/cal", methods=["POST"])
 def cal_webhook_debug():
     # --- 1) Verify shared secret (simple + effective) ---
-    incoming_secret = request.headers.get("X-Cal-Secret")
+    # incoming_secret = request.headers.get("X-Cal-Secret")
 
-    if not incoming_secret or incoming_secret != CAL_WEBHOOK_SECRET:
-        print("❌ Invalid or missing Cal webhook secret")
-        return jsonify({"error": "unauthorized"}), 401
+    # if not incoming_secret or incoming_secret != CAL_WEBHOOK_SECRET:
+    #     print("❌ Invalid or missing Cal webhook secret")
+    #     return jsonify({"error": "unauthorized"}), 401
 
     # --- 2) Log headers ---
     print("\n====== CAL WEBHOOK HEADERS ======")
