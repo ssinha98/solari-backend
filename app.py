@@ -32,6 +32,7 @@ import uuid
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup, NavigableString, Tag
 import html
+import stripe
 
 # from typing import List
 # Load environment variables from .env file
@@ -184,7 +185,7 @@ def send_email(to_email, subject, body, html_body=None):
         return None
 
     payload = {
-        "from": "Solari Robots <postmaster@robots.yourca.io>",
+        "from": "Team Robots @ Solari <postmaster@robots.usesolari.ai>",
         "to": to_email,
         "subject": subject,
         "text": body,
@@ -194,7 +195,7 @@ def send_email(to_email, subject, body, html_body=None):
 
     try:
         response = requests.post(
-            "https://api.mailgun.net/v3/robots.yourca.io/messages",
+            "https://api.mailgun.net/v3/robots.usesolari.ai/messages",
             auth=("api", mailgun_api_key),
             data=payload,
             timeout=10
@@ -562,6 +563,252 @@ def jira_connect():
     
     auth_url = "https://auth.atlassian.com/authorize?" + urlencode(query_params)
     return redirect(auth_url)
+
+# BILLING WORK
+
+# get stripe vars
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
+
+# build frontend urls
+APP_URL = os.environ.get("APP_URL", "http://localhost:3000")
+SUCCESS_URL = f"{APP_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+CANCEL_URL = f"{APP_URL}/billing/cancel"
+
+
+@app.route("/api/stripe/create_checkout_session", methods=["POST"])
+def create_checkout_session():
+    """
+    Creates a Stripe Checkout Session for a subscription with a 7-day free trial.
+
+    Body:
+      { "user_id": "<firebase_uid>" }
+
+    Returns:
+      { "url": "<stripe_checkout_url>", "team_id": "<team_id>" }
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    # 1) Look up user -> team_id
+    user_snap = db.collection("users").document(user_id).get()
+    if not user_snap.exists:
+        return jsonify({"error": f"User not found: {user_id}"}), 404
+
+    teamId = (user_snap.to_dict() or {}).get("teamId")
+    if not teamId:
+        return jsonify({"error": f"No team_id found for user {user_id}"}), 400
+
+    # 2) Optional: mark checkout started (NOT source of truth)
+    db.collection("teams").document(teamId).set(
+        {
+            "billing": {
+                "state": "checkout_started",
+                "intended_trial": True,
+                "checkout_started_by": user_id,
+                "checkout_started_at": firestore.SERVER_TIMESTAMP,
+            }
+        },
+        merge=True,
+    )
+
+    # 3) Create Stripe Checkout Session (subscription + 7-day trial)
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            subscription_data={
+                "trial_period_days": 7,
+                "metadata": {
+                    "team_id": teamId,
+                    "user_id": user_id,
+                },
+            },
+            client_reference_id=teamId,  # billing is team-scoped
+            metadata={
+                "team_id": teamId,
+                "user_id": user_id,
+                "intended_trial": "true",
+            },
+            success_url=SUCCESS_URL,
+            cancel_url=CANCEL_URL,
+        )
+    except stripe.error.StripeError as e:
+        return jsonify({"error": "Stripe error creating checkout session", "details": str(e)}), 400
+
+    return jsonify({"url": session.url, "team_id": teamId}), 200
+
+# building the response webhook
+# Map Stripe subscription statuses into your canonical set
+
+
+STRIPE_WEBHOOK_SECRET=os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+def now_server_ts():
+    return firestore.SERVER_TIMESTAMP
+
+def canonical_status(stripe_status: str) -> str:
+    """
+    Normalize Stripe subscription statuses into a smaller set for gating.
+    Stripe statuses can include: trialing, active, past_due, canceled, unpaid,
+    incomplete, incomplete_expired, paused.
+    """
+    if not stripe_status:
+        return "none"
+
+    s = stripe_status.lower()
+
+    if s in ("trialing", "active", "past_due", "canceled"):
+        return s
+
+    # Treat these as "past_due" for gating simplicity
+    if s in ("unpaid", "incomplete", "incomplete_expired", "paused"):
+        return "past_due"
+
+    return "none"
+
+
+def team_id_from_subscription(subscription_obj) -> str | None:
+    md = (subscription_obj.get("metadata") or {})
+    return md.get("team_id")
+
+
+def find_team_id_by_subscription_id(subscription_id: str) -> str | None:
+    if not subscription_id:
+        return None
+    matches = (
+        db.collection("teams")
+          .where("billing.stripe_subscription_id", "==", subscription_id)
+          .limit(1)
+          .get()
+    )
+    return matches[0].id if matches else None
+
+
+def upsert_team_billing(team_id: str, update: dict):
+    update["updated_at"] = now_server_ts()
+    db.collection("teams").document(team_id).set({"billing": update}, merge=True)
+
+@app.route("/api/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.get_data(as_text=False)
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except ValueError:
+        return jsonify({"error": "Invalid payload"}), 400
+    except stripe.error.SignatureVerificationError:
+        return jsonify({"error": "Invalid signature"}), 400
+
+    event_type = event["type"]
+    obj = event["data"]["object"]
+
+    # --- checkout.session.completed ---
+    if event_type == "checkout.session.completed":
+        # For Checkout Sessions, you set client_reference_id = team_id
+        team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("team_id")
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("subscription")
+
+        if team_id:
+            upsert_team_billing(team_id, {
+                "access_source": "stripe",
+                "state": "checkout_completed",
+                "stripe_customer_id": customer_id,
+                "stripe_subscription_id": subscription_id,
+            })
+
+        return jsonify({"received": True}), 200
+
+    # --- checkout.session.expired (optional) ---
+    if event_type == "checkout.session.expired":
+        team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("team_id")
+        if team_id:
+            upsert_team_billing(team_id, {
+                "access_source": "stripe",
+                "state": "checkout_expired",
+            })
+        return jsonify({"received": True}), 200
+
+    # --- customer.subscription.created / updated / deleted ---
+    if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+        subscription = obj
+        subscription_id = subscription.get("id")
+        customer_id = subscription.get("customer")
+        status = canonical_status(subscription.get("status"))
+
+        trial_end = subscription.get("trial_end")  # unix seconds or None
+        current_period_end = subscription.get("current_period_end")  # unix seconds
+
+        # Best: subscription.metadata.team_id (set via subscription_data.metadata during checkout creation)
+        team_id = team_id_from_subscription(subscription)
+
+        # Fallback: look up the team by stored subscription id
+        if not team_id:
+            team_id = find_team_id_by_subscription_id(subscription_id)
+
+        if team_id:
+            update = {
+                "access_source": "stripe",
+                "stripe_customer_id": customer_id,
+                "stripe_subscription_id": subscription_id,
+                "status": status,
+                "trial_ends_at": trial_end,
+                "current_period_end": current_period_end,
+            }
+
+            if event_type == "customer.subscription.created":
+                update["state"] = "subscription_created"
+            elif event_type == "customer.subscription.updated":
+                update["state"] = "subscription_updated"
+            else:
+                update["state"] = "subscription_deleted"
+                update["status"] = "canceled"
+
+            upsert_team_billing(team_id, update)
+
+        return jsonify({"received": True}), 200
+
+    # --- invoice.payment_failed ---
+    if event_type == "invoice.payment_failed":
+        invoice = obj
+        subscription_id = invoice.get("subscription")
+        team_id = find_team_id_by_subscription_id(subscription_id)
+
+        if team_id:
+            upsert_team_billing(team_id, {
+                "access_source": "stripe",
+                "state": "invoice_payment_failed",
+                "status": "past_due",
+            })
+
+        return jsonify({"received": True}), 200
+
+    # --- invoice.payment_succeeded ---
+    if event_type == "invoice.payment_succeeded":
+        invoice = obj
+        subscription_id = invoice.get("subscription")
+        team_id = find_team_id_by_subscription_id(subscription_id)
+
+        if team_id:
+            # Don’t blindly force "active" forever; but for MVP this is fine.
+            upsert_team_billing(team_id, {
+                "access_source": "stripe",
+                "state": "invoice_payment_succeeded",
+                "status": "active",
+            })
+
+        return jsonify({"received": True}), 200
+
+    # Ignore anything else
+    return jsonify({"received": True, "ignored": event_type}), 200
 
 @app.route("/auth/jira/callback", methods=['GET'])
 def jira_oauth_callback():
@@ -1569,7 +1816,10 @@ def invite_team_members():
         bounced_emails = []
         for email in emails:
             response = send_email(email, subject, text_body, html_body=html_body)
-            if not response or response.status_code != 200:
+            if not response:
+                bounced_emails.append(email)
+                continue
+            if response.status_code != 200:
                 bounced_emails.append(email)
 
         if bounced_emails:
