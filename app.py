@@ -746,6 +746,10 @@ def stripe_webhook():
 
         trial_end = subscription.get("trial_end")  # unix seconds or None
         current_period_end = subscription.get("current_period_end")  # unix seconds
+        cancel_at_period_end = subscription.get("cancel_at_period_end")
+        cancel_at = subscription.get("cancel_at")
+        canceled_at = subscription.get("canceled_at")
+        ended_at = subscription.get("ended_at")
 
         # Best: subscription.metadata.team_id (set via subscription_data.metadata during checkout creation)
         team_id = team_id_from_subscription(subscription)
@@ -763,6 +767,20 @@ def stripe_webhook():
                 "trial_ends_at": trial_end,
                 "current_period_end": current_period_end,
             }
+
+            update.update({
+                "stripe_status": subscription.get("status"),
+                "cancel_at_period_end": cancel_at_period_end,
+                "cancel_at": cancel_at,
+                "canceled_at": canceled_at,
+                "ended_at": ended_at,
+            })
+
+            access_expires_at = trial_end if status == "trialing" else current_period_end
+            update.update({
+                "will_renew": bool(status in ("trialing", "active") and not cancel_at_period_end),
+                "access_expires_at": access_expires_at,
+            })
 
             if event_type == "customer.subscription.created":
                 update["state"] = "subscription_created"
@@ -809,6 +827,59 @@ def stripe_webhook():
 
     # Ignore anything else
     return jsonify({"received": True, "ignored": event_type}), 200
+
+@app.route("/api/stripe/create_portal_session", methods=["POST"])
+def create_portal_session():
+    PORTAL_RETURN_URL = os.environ.get("PORTAL_RETURN_URL")
+    """
+    Body:
+      { "user_id": "<firebase_uid>" }
+
+    Returns:
+      { "url": "<stripe_customer_portal_url>" }
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    # 1) Look up user -> team_id
+    user_snap = db.collection("users").document(user_id).get()
+    if not user_snap.exists:
+        return jsonify({"error": f"User not found: {user_id}"}), 404
+
+    team_id = (user_snap.to_dict() or {}).get("teamId")
+    if not team_id:
+        return jsonify({"error": f"No team_id found for user {user_id}"}), 400
+
+    # 2) Look up team's stripe_customer_id
+    team_snap = db.collection("teams").document(team_id).get()
+    if not team_snap.exists:
+        return jsonify({"error": f"Team not found: {team_id}"}), 404
+
+    billing = (team_snap.to_dict() or {}).get("billing") or {}
+    customer_id = billing.get("stripe_customer_id")
+
+    if not customer_id:
+        return jsonify({"error": "No stripe_customer_id found for this team"}), 400
+
+    # 3) Create Stripe Customer Portal session
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=PORTAL_RETURN_URL,
+        )
+    except stripe.error.StripeError as e:
+        return jsonify(
+            {
+                "error": "Failed to create Stripe portal session",
+                "details": str(e),
+            }
+        ), 400
+
+    return jsonify({"url": session.url}), 200
+
 
 @app.route("/auth/jira/callback", methods=['GET'])
 def jira_oauth_callback():
