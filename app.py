@@ -343,6 +343,65 @@ def get_openai_client():
     api_key = get_api_key('OPENAI_API_KEY')
     return OpenAI(api_key=api_key)
 
+def get_keywordsai_client() -> OpenAI:
+    """Initialize and return KeywordsAI OpenAI-compatible client"""
+    api_key = get_api_key('KEYWORDS_API_KEY_PROD')
+    return OpenAI(base_url="https://api.keywordsai.co/api/", api_key=api_key)
+
+def get_agent_model_provider(db, team_id: str, agent_id: str) -> str:
+    """Fetch model_provider for an agent, defaulting if missing."""
+    try:
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return "gpt-4o-mini"
+        agent_data = agent_snap.to_dict() or {}
+        return agent_data.get("model_provider") or "gpt-4o-mini"
+    except Exception:
+        return "gpt-4o-mini"
+
+def keywordsai_chat_completion(
+    messages: list,
+    model: str = "gpt-4o-mini",
+    user_id: Optional[str] = None,
+    temperature: Optional[float] = None,
+) -> dict:
+    """
+    Call KeywordsAI chat completions with optional analytics metadata.
+    
+    Args:
+        messages: OpenAI-style messages payload
+        model: Model name for KeywordsAI router
+        user_id: Optional user id for analytics
+        temperature: Optional temperature override
+    
+    Returns:
+        Parsed JSON response from KeywordsAI
+    """
+    try:
+        client = get_keywordsai_client()
+        extra_body = {}
+        metadata = {}
+        if user_id:
+            extra_body["customer_identifier"] = user_id
+            metadata["user_id"] = user_id
+        if metadata:
+            extra_body["metadata"] = metadata
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            extra_body=extra_body if extra_body else None
+        )
+        return response.model_dump()
+    except Exception as e:
+        logger.error(f"KeywordsAI request failed: {str(e)}")
+        raise ValueError(f"KeywordsAI request failed: {str(e)}")
+
 # File processing functions
 def download_file_from_firebase(file_path: str) -> bytes:
     """
@@ -1198,7 +1257,7 @@ def cal_webhook():
                     "booked_by_user_id": user_id,
 
                     "cal_booking_id": booking_id,
-                    "reschedule_id": reschedule_id,
+                    "reschedule_id": uid,
                     "cal_booking_status": booking_status,
                     "cal_start_time": start_time,
                     "cal_end_time": end_time,
@@ -1220,7 +1279,7 @@ def cal_webhook():
                     "booked_by_user_id": user_id,
 
                     "cal_booking_id": booking_id,
-                    "reschedule_id": reschedule_id,
+                    "reschedule_id": uid,
                     "cal_booking_status": booking_status,
                     "cal_start_time": start_time,
                     "cal_end_time": end_time,
@@ -2434,6 +2493,67 @@ def add_agent_members():
     except Exception as e:
         logger.error(f"Error in add_agent_members: {str(e)}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/agent/update_model', methods=['POST'])
+@require_solari_key
+def update_agent_model():
+    """
+    Update the model_provider field for an agent.
+    
+    Expected request body:
+    {
+        "user_id": "user123",  # or "userid"
+        "agent_id": "agent123",  # or "agentId"
+        "model_provider": "gpt-4o-mini"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userid")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        model_provider = data.get("model_provider")
+
+        if not user_id or not agent_id or not model_provider:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, model_provider"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({
+                "success": False,
+                "error": "agent_not_found"
+            }), 404
+
+        agent_ref.update({
+            "model_provider": model_provider
+        })
+
+        return jsonify({
+            "success": True,
+            "agent_id": agent_id,
+            "model_provider": model_provider
+        }), 200
+    except Exception as e:
+        logger.error(f"Error updating agent model: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 @app.route('/api/agent/remove_members', methods=['POST', 'OPTIONS'])
 @require_solari_key
@@ -5326,7 +5446,14 @@ def check_table_plan():
 
 # rag related code
 
-def perform_rag_query(userid: str, namespace: str, query: str, nickname: str = '', source_type: str = ''):
+def perform_rag_query(
+    userid: str,
+    namespace: str,
+    query: str,
+    nickname: str = '',
+    source_type: str = '',
+    model: str = "gpt-4o-mini"
+):
     """
     Perform RAG query against Pinecone and generate answer.
     
@@ -5402,13 +5529,14 @@ CONTEXT:
 Using the CONTEXT provided, answer the QUESTION. Keep your answer grounded in the facts of the CONTEXT. If the CONTEXT doesn't contain the answer to the QUESTION, say you don't know."""
         
         # Step 5: Send to LLM to generate answer
-        logger.info("Generating answer using OpenAI...")
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}]
+        logger.info("Generating answer using KeywordsAI...")
+        response = keywordsai_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            user_id=userid
         )
-        
-        answer = response.choices[0].message.content
+
+        answer = response["choices"][0]["message"]["content"]
         logger.info(f"Generated answer: {answer[:100]}...")
         
         # Format results with metadata for reference
@@ -5478,7 +5606,13 @@ Which source nickname is most helpful for answering this query? Respond with ONL
         'user_prompt': user_prompt
     }
 
-def select_source_with_openai(query: str, sources: list, model: str = "gpt-3.5-turbo", temperature: float = 0.3) -> str:
+def select_source_with_openai(
+    query: str,
+    sources: list,
+    user_id: str,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.3
+) -> str:
     """
     Use OpenAI to select the most relevant source based on query and source descriptions.
     
@@ -5494,23 +5628,22 @@ def select_source_with_openai(query: str, sources: list, model: str = "gpt-3.5-t
     Raises:
         Exception: If OpenAI call fails
     """
-    openai_client = get_openai_client()
-    
     # Build prompts
     prompts = build_source_selection_prompt(query, sources)
     
-    logger.info("Using OpenAI to determine best source...")
-    response = openai_client.chat.completions.create(
-        model=model,
+    logger.info("Using KeywordsAI to determine best source...")
+    response = keywordsai_chat_completion(
         messages=[
             {"role": "system", "content": prompts['system_prompt']},
             {"role": "user", "content": prompts['user_prompt']}
         ],
+        model=model,
+        user_id=user_id,
         temperature=temperature
     )
     
-    selected_nickname = response.choices[0].message.content.strip()
-    logger.info(f"OpenAI selected nickname: {selected_nickname}")
+    selected_nickname = response["choices"][0]["message"]["content"].strip()
+    logger.info(f"KeywordsAI selected nickname: {selected_nickname}")
     
     return selected_nickname
 
@@ -5534,12 +5667,11 @@ def validate_selected_nickname(selected_nickname: str, sources: list) -> str:
     
     return selected_nickname
 
-def decide_source(team_id: str, userid: str, agent_id: str, namespace: str, query: str, source_type: str = ''):
+def decide_source(userid: str, agent_id: str, namespace: str, query: str, source_type: str = '', model: str = "gpt-4o-mini"):
     """
     Decide which source to use when no nickname is provided.
     
     Args:
-        team_id: Team identifier
         userid: User identifier
         agent_id: Agent identifier
         namespace: Pinecone namespace
@@ -5550,10 +5682,11 @@ def decide_source(team_id: str, userid: str, agent_id: str, namespace: str, quer
         dict with 'success', 'nickname' (if successful), and optionally 'error'
     """
     try:
+        db = firestore.client()
+        team_id = get_team_id_for_uid(db, userid)
         logger.info(f"Deciding source for team: {team_id}, user: {userid}, agent: {agent_id}, namespace: {namespace}, query: {query[:100]}...")
         
         # Step 1: Get list of sources from Firestore
-        db = firestore.client()
         sources_ref = (
             db.collection('teams').document(team_id)
               .collection('agents').document(agent_id)
@@ -5583,7 +5716,12 @@ def decide_source(team_id: str, userid: str, agent_id: str, namespace: str, quer
         logger.info(f"Found {len(sources)} sources with descriptions")
         
         # Step 2: Use OpenAI to select the best source
-        selected_nickname = select_source_with_openai(query, sources)
+        selected_nickname = select_source_with_openai(
+            query,
+            sources,
+            user_id=userid,
+            model=model
+        )
         
         # Step 3: Validate the selected nickname
         validated_nickname = validate_selected_nickname(selected_nickname, sources)
@@ -5684,9 +5822,10 @@ def ask_pinecone():
         # Optional parameters
         nickname = data.get('nickname', '')
         source_type = data.get('source_type', '')
+        model = "gpt-4o-mini"
         
         # Perform RAG query
-        result = perform_rag_query(userid, namespace, query, nickname, source_type)
+        result = perform_rag_query(userid, namespace, query, nickname, source_type, model=model)
         
         if result['success']:
             return jsonify(result), 200
@@ -5729,7 +5868,6 @@ def source_confirmed():
     {
         "requestId": "req-123",
         "suggestedSource": "optional-suggested-nickname",
-        "team_id": "team123",
         "userid": "user123",
         "agent_id": "agent123",  # required when nickname is provided
         "namespace": "your-namespace",  # optional, required only for RAG queries
@@ -5766,16 +5904,6 @@ def source_confirmed():
         request_id = data.get('requestId')
         
         # Validate required fields
-        team_id = data.get('team_id') or data.get('teamId')
-        if not team_id:
-            return jsonify({
-                'success': False,
-                'answer': None,
-                'metadata': None,
-                'error': 'team_id parameter is required',
-                'requestId': request_id
-            }), 400
-
         userid = data.get('userid')
         if not userid:
             return jsonify({
@@ -5813,12 +5941,25 @@ def source_confirmed():
                 'suggestedSource': suggested_source
             }), 400
         
+        try:
+            db = firestore.client()
+            team_id = get_team_id_for_uid(db, userid)
+        except KeyError as e:
+            return jsonify({
+                'success': False,
+                'answer': None,
+                'metadata': None,
+                'error': str(e),
+                'requestId': request_id,
+                'suggestedSource': suggested_source
+            }), 404
+
+        model = get_agent_model_provider(db, team_id, agent_id) if agent_id else "gpt-4o-mini"
         logger.info(f"Source confirmed for team: {team_id}, user: {userid}, agent: {agent_id}, namespace: {namespace}, nickname: {nickname}, query: {query[:100]}...")
         
         # If nickname is provided, check source type and route accordingly
         if nickname and agent_id:
             try:
-                db = firestore.client()
                 sources_ref = (
                     db.collection('teams').document(team_id)
                       .collection('agents').document(agent_id)
@@ -5879,7 +6020,7 @@ def source_confirmed():
                             }), 400
                         
                         logger.info(f"Source is not a table, running RAG query...")
-                        result = perform_rag_query(userid, namespace, query, nickname, source_type)
+                        result = perform_rag_query(userid, namespace, query, nickname, source_type, model=model)
                         
                         if result['success']:
                             result['requestId'] = request_id
@@ -5903,7 +6044,7 @@ def source_confirmed():
                             'suggestedSource': suggested_source
                         }), 400
                     
-                    result = perform_rag_query(userid, namespace, query, nickname, source_type)
+                    result = perform_rag_query(userid, namespace, query, nickname, source_type, model=model)
                     
                     if result['success']:
                         result['requestId'] = request_id
@@ -5927,7 +6068,7 @@ def source_confirmed():
                         'suggestedSource': suggested_source
                     }), 400
                 
-                result = perform_rag_query(userid, namespace, query, nickname, source_type)
+                result = perform_rag_query(userid, namespace, query, nickname, source_type, model=model)
                 
                 if result['success']:
                     result['requestId'] = request_id
@@ -5950,7 +6091,7 @@ def source_confirmed():
                     'suggestedSource': suggested_source
                 }), 400
             
-            result = perform_rag_query(userid, namespace, query, '', source_type)
+            result = perform_rag_query(userid, namespace, query, '', source_type, model=model)
             
             if result['success']:
                 result['requestId'] = request_id
@@ -6002,7 +6143,6 @@ def handle_rag_message():
     Expected request body:
     {
         "requestId": "req-123",
-        "team_id": "team123",
         "userid": "user123",
         "agent_id": "agent123",
         "namespace": "your-namespace",
@@ -6045,16 +6185,6 @@ def handle_rag_message():
             }), 400
         
         # Validate required fields
-        team_id = data.get('team_id') or data.get('teamId')
-        if not team_id:
-            return jsonify({
-                'success': False,
-                'answer': None,
-                'metadata': None,
-                'error': 'team_id parameter is required',
-                'requestId': request_id
-            }), 400
-
         userid = data.get('userid')
         if not userid:
             return jsonify({
@@ -6098,14 +6228,26 @@ def handle_rag_message():
         # Optional parameters
         nickname = data.get('nickname', '')
         source_type = data.get('source_type', '')
+        try:
+            db = firestore.client()
+            team_id = get_team_id_for_uid(db, userid)
+        except KeyError as e:
+            return jsonify({
+                'success': False,
+                'answer': None,
+                'metadata': None,
+                'error': str(e),
+                'requestId': request_id
+            }), 404
         
+        model = get_agent_model_provider(db, team_id, agent_id)
+
         # If nickname is present, check source type and route accordingly
         if nickname:
             logger.info(f"Nickname provided ({nickname}), checking source type...")
             
             # Look up source document to check type
             try:
-                db = firestore.client()
                 sources_ref = (
                     db.collection('teams').document(team_id)
                       .collection('agents').document(agent_id)
@@ -6141,7 +6283,7 @@ def handle_rag_message():
                 else:
                     # Not a table, proceed with RAG query
                     logger.info(f"Source is not a table, running RAG query...")
-                    result = perform_rag_query(userid, namespace, query, nickname, source_type)
+                    result = perform_rag_query(userid, namespace, query, nickname, source_type, model=model)
                     
                     if result['success']:
                         result['requestId'] = request_id
@@ -6163,7 +6305,7 @@ def handle_rag_message():
         # If no nickname, run decide_source function first
         else:
             logger.info("No nickname provided, running decide_source function...")
-            source_decision = decide_source(team_id, userid, agent_id, namespace, query, source_type)
+            source_decision = decide_source(userid, agent_id, namespace, query, source_type, model=model)
             
             if not source_decision['success']:
                 return jsonify({
