@@ -909,7 +909,7 @@ def cal_create_appointment():
     if not user_snap.exists:
         return jsonify({"error": f"User not found: {user_id}"}), 404
 
-    team_id = (user_snap.to_dict() or {}).get("team_id")
+    team_id = (user_snap.to_dict() or {}).get("teamId")
     if not team_id:
         return jsonify({"error": f"No team_id found for user {user_id}"}), 400
 
