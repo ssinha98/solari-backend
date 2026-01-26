@@ -580,48 +580,47 @@ CANCEL_URL = f"{APP_URL}/billing/cancel"
 
 @app.route("/api/stripe/create_checkout_session", methods=["POST"])
 def create_checkout_session():
-    """
-    Creates a Stripe Checkout Session for a subscription with a 7-day free trial.
-
-    Body:
-      { "user_id": "<firebase_uid>" }
-
-    Returns:
-      { "url": "<stripe_checkout_url>", "team_id": "<team_id>" }
-    """
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
     purchase = bool(data.get("purchase"))
+
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
 
-    # 1) Look up user -> team_id
     user_snap = db.collection("users").document(user_id).get()
     if not user_snap.exists:
         return jsonify({"error": f"User not found: {user_id}"}), 404
 
-    teamId = (user_snap.to_dict() or {}).get("teamId")
-    if not teamId:
+    # ✅ you said users/{user_id}.team_id
+    team_id = (user_snap.to_dict() or {}).get("team_id")
+    if not team_id:
         return jsonify({"error": f"No team_id found for user {user_id}"}), 400
-
-    # 2) Optional: mark checkout started (NOT source of truth)
-    db.collection("teams").document(teamId).set(
-        {
-            "billing": {
-                "state": "checkout_started",
-                "intended_trial": True,
-                "checkout_started_by": user_id,
-                "checkout_started_at": firestore.SERVER_TIMESTAMP,
-            }
-        },
-        merge=True,
-    )
 
     price_id = STRIPE_PRICE_ID_DISCOUNT if purchase else STRIPE_PRICE_ID
     if purchase and not STRIPE_PRICE_ID_DISCOUNT:
         return jsonify({"error": "Missing STRIPE_PRICE_ID_DISCOUNT"}), 500
 
-    # 3) Create Stripe Checkout Session (subscription + 7-day trial)
+    intended_trial = (not purchase)
+    plan = "discount_no_trial" if purchase else "trial"
+
+    # ✅ Only mark attempt/intention — NOT access
+    db.collection("teams").document(team_id).set(
+        {
+            "billing": {
+                "access_source": "stripe",
+                "state": "checkout_started",
+                "status": "pending_payment",          # ✅ consistent canonical state
+                "intended_trial": intended_trial,
+                "plan": plan,
+                "price_id": price_id,
+                "checkout_started_by": user_id,
+                "checkout_started_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+        },
+        merge=True,
+    )
+
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
@@ -629,19 +628,19 @@ def create_checkout_session():
             subscription_data={
                 **({} if purchase else {"trial_period_days": 7}),
                 "metadata": {
-                    "team_id": teamId,
+                    "team_id": team_id,
                     "user_id": user_id,
-                    "purchase": str(purchase).lower(),
+                    "plan": plan,
                     "price_id": price_id,
                 },
             },
-            client_reference_id=teamId,  # billing is team-scoped
+            client_reference_id=team_id,
             metadata={
-                "team_id": teamId,
+                "team_id": team_id,
                 "user_id": user_id,
-                "intended_trial": "false" if purchase else "true",
-                "purchase": str(purchase).lower(),
+                "plan": plan,
                 "price_id": price_id,
+                "intended_trial": "true" if intended_trial else "false",
             },
             success_url=SUCCESS_URL,
             cancel_url=CANCEL_URL,
@@ -649,22 +648,7 @@ def create_checkout_session():
     except stripe.error.StripeError as e:
         return jsonify({"error": "Stripe error creating checkout session", "details": str(e)}), 400
 
-    if purchase:
-        db.collection("teams").document(teamId).set(
-            {
-                "billing": {
-                    "status": "active",
-                    "price_id": price_id,
-                    "will_renew": True,
-                    "trial_ends_at": None,
-                    "plan": "discount_no_trial",
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                }
-            },
-            merge=True,
-        )
-
-    return jsonify({"url": session.url, "team_id": teamId}), 200
+    return jsonify({"url": session.url, "team_id": team_id}), 200
 
 # building the response webhook
 # Map Stripe subscription statuses into your canonical set
@@ -676,25 +660,79 @@ def now_server_ts():
     return firestore.SERVER_TIMESTAMP
 
 def canonical_status(stripe_status: str) -> str:
-    """
-    Normalize Stripe subscription statuses into a smaller set for gating.
-    Stripe statuses can include: trialing, active, past_due, canceled, unpaid,
-    incomplete, incomplete_expired, paused.
-    """
     if not stripe_status:
         return "none"
-
     s = stripe_status.lower()
 
-    if s in ("trialing", "active", "past_due", "canceled"):
-        return s
+    if s == "trialing":
+        return "trialing"
+    if s == "active":
+        return "active"
+    if s in ("canceled", "unpaid"):
+        return "canceled"
 
-    # Treat these as "past_due" for gating simplicity
-    if s in ("unpaid", "incomplete", "incomplete_expired", "paused"):
+    # ✅ IMPORTANT: incomplete is not past_due
+    if s in ("incomplete", "incomplete_expired"):
+        return "pending_payment"
+
+    if s in ("past_due",):
         return "past_due"
+
+    if s in ("paused",):
+        return "paused"
 
     return "none"
 
+def write_billing_from_subscription(team_id: str, subscription: dict, state: str):
+    subscription_id = subscription.get("id")
+    customer_id = subscription.get("customer")
+    stripe_status = subscription.get("status")
+    status = canonical_status(stripe_status)
+
+    trial_end = subscription.get("trial_end")
+    current_period_end = subscription.get("current_period_end")
+    cancel_at_period_end = subscription.get("cancel_at_period_end")
+    cancel_at = subscription.get("cancel_at")
+    canceled_at = subscription.get("canceled_at")
+    ended_at = subscription.get("ended_at")
+
+    md = subscription.get("metadata") or {}
+    plan = md.get("plan")
+    price_id = md.get("price_id")
+
+    # fallback: infer price_id from subscription items if metadata missing
+    if not price_id:
+        items = ((subscription.get("items") or {}).get("data") or [])
+        if items and (items[0].get("price") or {}).get("id"):
+            price_id = items[0]["price"]["id"]
+
+    access_expires_at = trial_end if status == "trialing" else current_period_end
+
+    upsert_team_billing(team_id, {
+        "access_source": "stripe",
+        "state": state,
+
+        "stripe_customer_id": customer_id,
+        "stripe_subscription_id": subscription_id,
+
+        # raw + canonical
+        "stripe_status": stripe_status,
+        "status": status,
+
+        "plan": plan,
+        "price_id": price_id,
+
+        "trial_ends_at": trial_end,
+        "current_period_end": current_period_end,
+
+        "cancel_at_period_end": bool(cancel_at_period_end),
+        "cancel_at": cancel_at,
+        "canceled_at": canceled_at,
+        "ended_at": ended_at,
+
+        "will_renew": bool(status in ("trialing", "active") and not cancel_at_period_end),
+        "access_expires_at": access_expires_at,
+    })
 
 def team_id_from_subscription(subscription_obj) -> str | None:
     md = (subscription_obj.get("metadata") or {})
@@ -738,85 +776,47 @@ def stripe_webhook():
 
     # --- checkout.session.completed ---
     if event_type == "checkout.session.completed":
-        # For Checkout Sessions, you set client_reference_id = team_id
         team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("team_id")
-        customer_id = obj.get("customer")
-        subscription_id = obj.get("subscription")
-
         if team_id:
             upsert_team_billing(team_id, {
                 "access_source": "stripe",
                 "state": "checkout_completed",
-                "stripe_customer_id": customer_id,
-                "stripe_subscription_id": subscription_id,
-            })
-
-        return jsonify({"received": True}), 200
-
-    # --- checkout.session.expired (optional) ---
-    if event_type == "checkout.session.expired":
-        team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("team_id")
-        if team_id:
-            upsert_team_billing(team_id, {
-                "access_source": "stripe",
-                "state": "checkout_expired",
+                "stripe_customer_id": obj.get("customer"),
+                "stripe_subscription_id": obj.get("subscription"),
+                # ✅ still don't force active here
             })
         return jsonify({"received": True}), 200
 
-    # --- customer.subscription.created / updated / deleted ---
+    # --- subscription events ---
     if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
         subscription = obj
         subscription_id = subscription.get("id")
-        customer_id = subscription.get("customer")
-        status = canonical_status(subscription.get("status"))
 
-        trial_end = subscription.get("trial_end")  # unix seconds or None
-        current_period_end = subscription.get("current_period_end")  # unix seconds
-        cancel_at_period_end = subscription.get("cancel_at_period_end")
-        cancel_at = subscription.get("cancel_at")
-        canceled_at = subscription.get("canceled_at")
-        ended_at = subscription.get("ended_at")
-
-        # Best: subscription.metadata.team_id (set via subscription_data.metadata during checkout creation)
-        team_id = team_id_from_subscription(subscription)
-
-        # Fallback: look up the team by stored subscription id
+        team_id = (subscription.get("metadata") or {}).get("team_id")
         if not team_id:
             team_id = find_team_id_by_subscription_id(subscription_id)
 
         if team_id:
-            update = {
-                "access_source": "stripe",
-                "stripe_customer_id": customer_id,
-                "stripe_subscription_id": subscription_id,
-                "status": status,
-                "trial_ends_at": trial_end,
-                "current_period_end": current_period_end,
-            }
+            state = (
+                "subscription_created" if event_type == "customer.subscription.created"
+                else "subscription_updated" if event_type == "customer.subscription.updated"
+                else "subscription_deleted"
+            )
+            # If deleted, Stripe status might still be present; this will map to canceled
+            write_billing_from_subscription(team_id, subscription, state)
 
-            update.update({
-                "stripe_status": subscription.get("status"),
-                "cancel_at_period_end": cancel_at_period_end,
-                "cancel_at": cancel_at,
-                "canceled_at": canceled_at,
-                "ended_at": ended_at,
-            })
+        return jsonify({"received": True}), 200
 
-            access_expires_at = trial_end if status == "trialing" else current_period_end
-            update.update({
-                "will_renew": bool(status in ("trialing", "active") and not cancel_at_period_end),
-                "access_expires_at": access_expires_at,
-            })
+    # --- invoice.payment_succeeded ---
+    if event_type == "invoice.payment_succeeded":
+        invoice = obj
+        subscription_id = invoice.get("subscription")
+        team_id = find_team_id_by_subscription_id(subscription_id)
 
-            if event_type == "customer.subscription.created":
-                update["state"] = "subscription_created"
-            elif event_type == "customer.subscription.updated":
-                update["state"] = "subscription_updated"
-            else:
-                update["state"] = "subscription_deleted"
-                update["status"] = "canceled"
-
-            upsert_team_billing(team_id, update)
+        if team_id and subscription_id:
+            # ✅ Pull the authoritative subscription state after payment
+            sub = stripe.Subscription.retrieve(subscription_id)
+            write_billing_from_subscription(team_id, sub, "invoice_payment_succeeded")
 
         return jsonify({"received": True}), 200
 
@@ -831,27 +831,11 @@ def stripe_webhook():
                 "access_source": "stripe",
                 "state": "invoice_payment_failed",
                 "status": "past_due",
+                "will_renew": False,
             })
 
         return jsonify({"received": True}), 200
 
-    # --- invoice.payment_succeeded ---
-    if event_type == "invoice.payment_succeeded":
-        invoice = obj
-        subscription_id = invoice.get("subscription")
-        team_id = find_team_id_by_subscription_id(subscription_id)
-
-        if team_id:
-            # Don’t blindly force "active" forever; but for MVP this is fine.
-            upsert_team_billing(team_id, {
-                "access_source": "stripe",
-                "state": "invoice_payment_succeeded",
-                "status": "active",
-            })
-
-        return jsonify({"received": True}), 200
-
-    # Ignore anything else
     return jsonify({"received": True, "ignored": event_type}), 200
 
 @app.route("/api/stripe/create_portal_session", methods=["POST"])
