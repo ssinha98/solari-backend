@@ -570,6 +570,7 @@ def jira_connect():
 # get stripe vars
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
+STRIPE_PRICE_ID_DISCOUNT = os.environ.get("STRIPE_PRICE_ID_DISCOUNT")
 
 # build frontend urls
 APP_URL = os.environ.get("APP_URL", "http://localhost:3000")
@@ -590,6 +591,7 @@ def create_checkout_session():
     """
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
+    purchase = bool(data.get("purchase"))
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
 
@@ -615,29 +617,52 @@ def create_checkout_session():
         merge=True,
     )
 
+    price_id = STRIPE_PRICE_ID_DISCOUNT if purchase else STRIPE_PRICE_ID
+    if purchase and not STRIPE_PRICE_ID_DISCOUNT:
+        return jsonify({"error": "Missing STRIPE_PRICE_ID_DISCOUNT"}), 500
+
     # 3) Create Stripe Checkout Session (subscription + 7-day trial)
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            line_items=[{"price": price_id, "quantity": 1}],
             subscription_data={
-                "trial_period_days": 7,
+                **({} if purchase else {"trial_period_days": 7}),
                 "metadata": {
                     "team_id": teamId,
                     "user_id": user_id,
+                    "purchase": str(purchase).lower(),
+                    "price_id": price_id,
                 },
             },
             client_reference_id=teamId,  # billing is team-scoped
             metadata={
                 "team_id": teamId,
                 "user_id": user_id,
-                "intended_trial": "true",
+                "intended_trial": "false" if purchase else "true",
+                "purchase": str(purchase).lower(),
+                "price_id": price_id,
             },
             success_url=SUCCESS_URL,
             cancel_url=CANCEL_URL,
         )
     except stripe.error.StripeError as e:
         return jsonify({"error": "Stripe error creating checkout session", "details": str(e)}), 400
+
+    if purchase:
+        db.collection("teams").document(teamId).set(
+            {
+                "billing": {
+                    "status": "active",
+                    "price_id": price_id,
+                    "will_renew": True,
+                    "trial_ends_at": None,
+                    "plan": "discount_no_trial",
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            },
+            merge=True,
+        )
 
     return jsonify({"url": session.url, "team_id": teamId}), 200
 
