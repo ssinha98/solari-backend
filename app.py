@@ -592,8 +592,8 @@ def create_checkout_session():
         return jsonify({"error": f"User not found: {user_id}"}), 404
 
     # ✅ you said users/{user_id}.team_id
-    team_id = (user_snap.to_dict() or {}).get("teamId")
-    if not team_id:
+    teamId = (user_snap.to_dict() or {}).get("teamId")
+    if not teamId:
         return jsonify({"error": f"No team_id found for user {user_id}"}), 400
 
     price_id = STRIPE_PRICE_ID_DISCOUNT if purchase else STRIPE_PRICE_ID
@@ -604,7 +604,7 @@ def create_checkout_session():
     plan = "discount_no_trial" if purchase else "trial"
 
     # ✅ Only mark attempt/intention — NOT access
-    db.collection("teams").document(team_id).set(
+    db.collection("teams").document(teamId).set(
         {
             "billing": {
                 "access_source": "stripe",
@@ -628,15 +628,15 @@ def create_checkout_session():
             subscription_data={
                 **({} if purchase else {"trial_period_days": 7}),
                 "metadata": {
-                    "team_id": team_id,
+                    "teamId": teamId,
                     "user_id": user_id,
                     "plan": plan,
                     "price_id": price_id,
                 },
             },
-            client_reference_id=team_id,
+            client_reference_id=teamId,
             metadata={
-                "team_id": team_id,
+                "teamId": teamId,
                 "user_id": user_id,
                 "plan": plan,
                 "price_id": price_id,
@@ -648,7 +648,7 @@ def create_checkout_session():
     except stripe.error.StripeError as e:
         return jsonify({"error": "Stripe error creating checkout session", "details": str(e)}), 400
 
-    return jsonify({"url": session.url, "team_id": team_id}), 200
+    return jsonify({"url": session.url, "team_id": teamId}), 200
 
 # building the response webhook
 # Map Stripe subscription statuses into your canonical set
@@ -682,6 +682,10 @@ def canonical_status(stripe_status: str) -> str:
         return "paused"
 
     return "none"
+
+def upsert_team_billing(team_id: str, update: dict):
+    update["updated_at"] = now_server_ts()
+    db.collection("teams").document(team_id).set({"billing": update}, merge=True)
 
 def write_billing_from_subscription(team_id: str, subscription: dict, state: str):
     subscription_id = subscription.get("id")
@@ -751,50 +755,75 @@ def find_team_id_by_subscription_id(subscription_id: str) -> str | None:
     return matches[0].id if matches else None
 
 
-def upsert_team_billing(team_id: str, update: dict):
-    update["updated_at"] = now_server_ts()
-    db.collection("teams").document(team_id).set({"billing": update}, merge=True)
+def _log(obj, label=""):
+    try:
+        print(f"\n===== {label} =====")
+        print(json.dumps(obj, indent=2, default=str)[:8000])  # cap to avoid huge logs
+    except Exception as e:
+        print(f"\n===== {label} (failed to json dump: {e}) =====")
+        print(str(obj)[:8000])
 
 @app.route("/api/stripe/webhook", methods=["POST"])
 def stripe_webhook():
-    payload = request.get_data(as_text=False)
+    raw = request.get_data(as_text=False)
     sig_header = request.headers.get("Stripe-Signature", "")
+
+    # Helpful header log (signature only)
+    print("\n🔥 STRIPE WEBHOOK HIT")
+    print("Stripe-Signature present:", bool(sig_header))
+    print("Raw bytes len:", len(raw))
 
     try:
         event = stripe.Webhook.construct_event(
-            payload=payload,
+            payload=raw,
             sig_header=sig_header,
             secret=STRIPE_WEBHOOK_SECRET,
         )
     except ValueError:
+        print("❌ Invalid payload")
         return jsonify({"error": "Invalid payload"}), 400
     except stripe.error.SignatureVerificationError:
+        print("❌ Invalid signature")
         return jsonify({"error": "Invalid signature"}), 400
 
-    event_type = event["type"]
-    obj = event["data"]["object"]
+    event_type = event.get("type")
+    obj = (event.get("data") or {}).get("object") or {}
+
+    print("\n✅ Event type:", event_type)
+    print("Object type:", obj.get("object"))
+    print("Object id:", obj.get("id"))
 
     # --- checkout.session.completed ---
     if event_type == "checkout.session.completed":
         team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("teamId")
+        print("checkout.session.completed teamId:", team_id)
+        _log(obj.get("metadata") or {}, "checkout.session.completed metadata")
+
         if team_id:
             upsert_team_billing(team_id, {
                 "access_source": "stripe",
                 "state": "checkout_completed",
                 "stripe_customer_id": obj.get("customer"),
                 "stripe_subscription_id": obj.get("subscription"),
-                # ✅ still don't force active here
             })
+
         return jsonify({"received": True}), 200
 
     # --- subscription events ---
     if event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
-        subscription = obj
-        subscription_id = subscription.get("id")
+        sub = obj
+        sub_id = sub.get("id")
+        stripe_status = sub.get("status")
 
-        team_id = (subscription.get("metadata") or {}).get("teamId")
+        md = sub.get("metadata") or {}
+        team_id = md.get("teamId")
         if not team_id:
-            team_id = find_team_id_by_subscription_id(subscription_id)
+            team_id = find_team_id_by_subscription_id(sub_id)
+
+        print("subscription id:", sub_id)
+        print("subscription status:", stripe_status)
+        _log(md, "subscription.metadata (raw)")
+        print("resolved teamId:", team_id)
 
         if team_id:
             state = (
@@ -802,40 +831,100 @@ def stripe_webhook():
                 else "subscription_updated" if event_type == "customer.subscription.updated"
                 else "subscription_deleted"
             )
-            # If deleted, Stripe status might still be present; this will map to canceled
-            write_billing_from_subscription(team_id, subscription, state)
+            write_billing_from_subscription(team_id, sub, state)
 
         return jsonify({"received": True}), 200
 
-    # --- invoice.payment_succeeded ---
-    if event_type == "invoice.payment_succeeded":
-        invoice = obj
-        subscription_id = invoice.get("subscription")
-        team_id = find_team_id_by_subscription_id(subscription_id)
+    # --- invoice success (covers invoice_payment.paid + invoice.paid + invoice.payment_succeeded) ---
+    if event_type in ("invoice_payment.paid", "invoice.paid", "invoice.payment_succeeded"):
+        subscription_id = None
+        invoice_id = None
 
-        if team_id and subscription_id:
-            # ✅ Pull the authoritative subscription state after payment
-            sub = stripe.Subscription.retrieve(subscription_id)
-            write_billing_from_subscription(team_id, sub, "invoice_payment_succeeded")
+        if obj.get("object") == "invoice_payment":
+            invoice_id = obj.get("invoice")
+            print("invoice_payment.paid invoice id:", invoice_id)
 
-        return jsonify({"received": True}), 200
+            if invoice_id:
+                invoice = stripe.Invoice.retrieve(invoice_id)
+                subscription_id = invoice.get("subscription")
+                print("retrieved invoice subscription id:", subscription_id)
 
-    # --- invoice.payment_failed ---
-    if event_type == "invoice.payment_failed":
-        invoice = obj
-        subscription_id = invoice.get("subscription")
-        team_id = find_team_id_by_subscription_id(subscription_id)
+                # lightweight invoice log
+                _log({
+                    "id": invoice.get("id"),
+                    "status": invoice.get("status"),
+                    "paid": invoice.get("paid"),
+                    "subscription": invoice.get("subscription"),
+                    "customer": invoice.get("customer"),
+                    "total": invoice.get("total"),
+                    "payment_intent": invoice.get("payment_intent"),
+                }, "invoice (summary)")
+        else:
+            # invoice object directly
+            invoice_id = obj.get("id")
+            subscription_id = obj.get("subscription")
+            print("invoice event invoice id:", invoice_id)
+            print("invoice event subscription id:", subscription_id)
+
+        if not subscription_id:
+            print("⚠️ No subscription id found on invoice success event")
+            return jsonify({"received": True}), 200
+
+        # Fetch authoritative subscription
+        sub = stripe.Subscription.retrieve(subscription_id)
+        sub_md = sub.get("metadata") or {}
+        team_id = sub_md.get("teamId") or find_team_id_by_subscription_id(subscription_id)
+
+        print("retrieved subscription id:", sub.get("id"))
+        print("retrieved subscription status:", sub.get("status"))
+        print("retrieved subscription current_period_end:", sub.get("current_period_end"))
+        print("retrieved subscription trial_end:", sub.get("trial_end"))
+        _log(sub_md, "subscription.metadata (retrieved)")
+        print("resolved teamId:", team_id)
+
+        # Optional: log price id from items
+        items = ((sub.get("items") or {}).get("data") or [])
+        first_price = (items[0].get("price") or {}).get("id") if items else None
+        print("subscription first price id:", first_price)
 
         if team_id:
-            upsert_team_billing(team_id, {
-                "access_source": "stripe",
-                "state": "invoice_payment_failed",
-                "status": "past_due",
-                "will_renew": False,
-            })
+            write_billing_from_subscription(team_id, sub, "invoice_payment_succeeded")
+        else:
+            print("⚠️ Could not resolve teamId for subscription:", subscription_id)
 
         return jsonify({"received": True}), 200
 
+    # --- invoice payment failed ---
+    if event_type in ("invoice.payment_failed", "invoice_payment.failed"):
+        subscription_id = None
+        invoice_id = None
+
+        if obj.get("object") == "invoice_payment":
+            invoice_id = obj.get("invoice")
+            print("invoice_payment.failed invoice id:", invoice_id)
+            if invoice_id:
+                invoice = stripe.Invoice.retrieve(invoice_id)
+                subscription_id = invoice.get("subscription")
+                print("retrieved invoice subscription id:", subscription_id)
+        else:
+            invoice_id = obj.get("id")
+            subscription_id = obj.get("subscription")
+
+        if subscription_id:
+            team_id = find_team_id_by_subscription_id(subscription_id)
+            print("resolved teamId:", team_id)
+
+            if team_id:
+                upsert_team_billing(team_id, {
+                    "access_source": "stripe",
+                    "state": "invoice_payment_failed",
+                    "status": "past_due",
+                    "will_renew": False,
+                })
+
+        return jsonify({"received": True}), 200
+
+    print("ℹ️ Ignored event type:", event_type)
     return jsonify({"received": True, "ignored": event_type}), 200
 
 @app.route("/api/stripe/create_portal_session", methods=["POST"])
@@ -8713,7 +8802,7 @@ def teams_create_invite_code():
       { "uid": "...", "team_id": "..." }
 
     Claims a globally-unique 6-digit code by creating:
-      team_invite_codes/{code} -> { team_id, created_by_uid, created_at }
+      team_invite_codes/{code} -> { teamId, created_by_uid, created_at }
     """
     body = request.get_json(silent=True) or {}
     uid = (body.get("uid") or "").strip()
@@ -8737,7 +8826,7 @@ def teams_create_invite_code():
         try:
             # create() is atomic and fails if doc already exists
             code_ref.create({
-                "team_id": team_id,
+                "teamId": team_id,
                 "created_by_uid": uid,
                 "created_at": firestore.SERVER_TIMESTAMP,
                 "status": "active",
@@ -8781,7 +8870,7 @@ def team_join_team_invite_code():
         return jsonify({"ok": False, "error": "invite_code_not_found"}), 404
 
     data = snap.to_dict() or {}
-    team_id = data.get("team_id")
+    team_id = data.get("teamId")
     if not team_id:
         return jsonify({"ok": False, "error": "team_id_missing_for_code"}), 500
 
