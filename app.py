@@ -9119,7 +9119,8 @@ def team_join_team_invite_code():
         return jsonify({"ok": False, "error": "invite_code_not_found"}), 404
 
     data = snap.to_dict() or {}
-    team_id = data.get("teamId")
+    # Accept legacy or new field names for compatibility.
+    team_id = data.get("team_id") or data.get("teamId")
     if not team_id:
         return jsonify({"ok": False, "error": "team_id_missing_for_code"}), 500
 
