@@ -979,6 +979,106 @@ def create_portal_session():
 
     return jsonify({"url": session.url}), 200
 
+@app.route("/settings/manage_builling", methods=["POST"])
+@require_solari_key
+def manage_builling():
+    """
+    Body:
+      { "user_id": "<firebase_uid>" }
+
+    Behavior:
+      - If billing.access_source == "calendar", start Stripe Checkout.
+      - If billing.access_source == "stripe", open Stripe Customer Portal.
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    user_snap = db.collection("users").document(user_id).get()
+    if not user_snap.exists:
+        return jsonify({"error": f"User not found: {user_id}"}), 404
+
+    team_id = (user_snap.to_dict() or {}).get("teamId")
+    if not team_id:
+        return jsonify({"error": f"No team_id found for user {user_id}"}), 400
+
+    team_snap = db.collection("teams").document(team_id).get()
+    if not team_snap.exists:
+        return jsonify({"error": f"Team not found: {team_id}"}), 404
+
+    billing = (team_snap.to_dict() or {}).get("billing") or {}
+    access_source = (billing.get("access_source") or "").strip().lower()
+    billing_status = (billing.get("status") or "").strip().lower()
+
+    if access_source == "calendar" or (access_source == "stripe" and billing_status == "pending_payment"):
+        price_id = STRIPE_PRICE_ID
+        intended_trial = True
+        plan = "trial"
+
+        db.collection("teams").document(team_id).set(
+            {
+                "billing": {
+                    "state": "checkout_started",
+                    "status": "pending_payment",
+                    "intended_trial": intended_trial,
+                    "plan": plan,
+                    "price_id": price_id,
+                    "checkout_started_by": user_id,
+                    "checkout_started_at": firestore.SERVER_TIMESTAMP,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            },
+            merge=True,
+        )
+
+        try:
+            session = stripe.checkout.Session.create(
+                mode="subscription",
+                line_items=[{"price": price_id, "quantity": 1}],
+                subscription_data={
+                    "trial_period_days": 7,
+                    "metadata": {
+                        "teamId": team_id,
+                        "user_id": user_id,
+                        "plan": plan,
+                        "price_id": price_id,
+                    },
+                },
+                client_reference_id=team_id,
+                metadata={
+                    "teamId": team_id,
+                    "user_id": user_id,
+                    "plan": plan,
+                    "price_id": price_id,
+                    "intended_trial": "true",
+                },
+                success_url=SUCCESS_URL,
+                cancel_url=CANCEL_URL,
+            )
+        except stripe.error.StripeError as e:
+            return jsonify({"error": "Stripe error creating checkout session", "details": str(e)}), 400
+
+        return jsonify({"url": session.url, "team_id": team_id, "flow": "stripe_checkout"}), 200
+
+    if access_source == "stripe":
+        PORTAL_RETURN_URL = os.environ.get("PORTAL_RETURN_URL")
+        customer_id = billing.get("stripe_customer_id")
+        if not customer_id:
+            return jsonify({"error": "No stripe_customer_id found for this team"}), 400
+        try:
+            session = stripe.billing_portal.Session.create(
+                customer=customer_id,
+                return_url=PORTAL_RETURN_URL,
+            )
+        except stripe.error.StripeError as e:
+            return jsonify({"error": "Failed to create Stripe portal session", "details": str(e)}), 400
+
+        return jsonify({"url": session.url, "team_id": team_id, "flow": "stripe_portal"}), 200
+
+    return jsonify({"error": "Unsupported billing access_source", "access_source": access_source}), 400
+
 # Booking - calendar route code
 CAL_WEBHOOK_SECRET = os.environ.get("SOLARI_INTERNAL_KEY")  # same internal key you set in Cal
 CAL_EVENT_URL = os.environ.get(
@@ -1037,6 +1137,9 @@ def cal_create_appointment():
 def cal_webhook():
     payload = request.get_json(silent=True) or {}
 
+    print("\n====== CAL WEBHOOK PAYLOAD ======")
+    print(json.dumps(payload, indent=2, default=str))
+
     trigger = payload.get("triggerEvent")
     p = payload.get("payload") or {}
     metadata = p.get("metadata") or {}
@@ -1058,6 +1161,7 @@ def cal_webhook():
     booking_status = p.get("status")  # e.g. "ACCEPTED"
     start_time = p.get("startTime")
     end_time = p.get("endTime")
+    uid = payload["payload"]["uid"]
 
     video_url = metadata.get("videoCallUrl") or (p.get("videoCallData") or {}).get("url")
 
@@ -1071,6 +1175,7 @@ def cal_webhook():
                     "booked_by_user_id": user_id,
 
                     "cal_booking_id": booking_id,
+                    "reschedule_id": uid,
                     "cal_booking_status": booking_status,
                     "cal_start_time": start_time,
                     "cal_end_time": end_time,
@@ -1093,6 +1198,7 @@ def cal_webhook():
                     "booked_by_user_id": user_id,
 
                     "cal_booking_id": booking_id,
+                    "reschedule_id": reschedule_id,
                     "cal_booking_status": booking_status,
                     "cal_start_time": start_time,
                     "cal_end_time": end_time,
@@ -1114,6 +1220,7 @@ def cal_webhook():
                     "booked_by_user_id": user_id,
 
                     "cal_booking_id": booking_id,
+                    "reschedule_id": reschedule_id,
                     "cal_booking_status": booking_status,
                     "cal_start_time": start_time,
                     "cal_end_time": end_time,
