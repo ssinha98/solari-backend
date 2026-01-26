@@ -592,7 +592,7 @@ def create_checkout_session():
         return jsonify({"error": f"User not found: {user_id}"}), 404
 
     # ✅ you said users/{user_id}.team_id
-    team_id = (user_snap.to_dict() or {}).get("team_id")
+    team_id = (user_snap.to_dict() or {}).get("teamId")
     if not team_id:
         return jsonify({"error": f"No team_id found for user {user_id}"}), 400
 
@@ -736,7 +736,7 @@ def write_billing_from_subscription(team_id: str, subscription: dict, state: str
 
 def team_id_from_subscription(subscription_obj) -> str | None:
     md = (subscription_obj.get("metadata") or {})
-    return md.get("team_id")
+    return md.get("teamId")
 
 
 def find_team_id_by_subscription_id(subscription_id: str) -> str | None:
@@ -776,7 +776,7 @@ def stripe_webhook():
 
     # --- checkout.session.completed ---
     if event_type == "checkout.session.completed":
-        team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("team_id")
+        team_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("teamId")
         if team_id:
             upsert_team_billing(team_id, {
                 "access_source": "stripe",
@@ -792,7 +792,7 @@ def stripe_webhook():
         subscription = obj
         subscription_id = subscription.get("id")
 
-        team_id = (subscription.get("metadata") or {}).get("team_id")
+        team_id = (subscription.get("metadata") or {}).get("teamId")
         if not team_id:
             team_id = find_team_id_by_subscription_id(subscription_id)
 
