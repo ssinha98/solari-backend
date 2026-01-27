@@ -7448,7 +7448,7 @@ def slack_oauth_callback():
 
     # 4. Redirect user back to frontend settings page
     return redirect(
-        "https://solari-frontend-prod.vercel.app/settings/slack_callback",
+        "https://app.usesolari.ai/settings/slack_callback",
         code=302
     )
 
