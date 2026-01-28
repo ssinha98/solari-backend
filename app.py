@@ -126,7 +126,7 @@ def get_all_env_vars() -> dict:
     return dict(os.environ)
 
 # Jira OAuth Configuration
-ATLASSIAN_REDIRECT_URI = 'https://solari-backend.onrender.com/auth/jira/callback'
+ATLASSIAN_REDIRECT_URI = 'https://app.useaolari.ai/auth/jira/callback'
 FRONTEND_SUCCESS_URL = os.getenv('FRONTEND_SUCCESS_URL', 'http://localhost:3000')
 
 # Security: Solari Key validation
@@ -1643,7 +1643,7 @@ def _fetch_confluence_page_storage_body(user_id: str, page_id: str, base_url: st
         "body_format": "storage",
     }
 
-    response = requests.get(url, headers=headers, params=params, timeout=10)
+    response = requests.get(url, headers=headers, params=params, timeout=45)
     if response.status_code != 200:
         raise Exception(f"Failed to fetch Confluence page body: {response.text}")
     page_data = (response.json() or {}).get("page") or {}
@@ -6615,7 +6615,7 @@ def confluence_search_pages():
             "limit": limit
         }
         
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, headers=headers, params=params, timeout=45)
         
         if response.status_code != 200:
             logger.error(f"Failed to search Confluence pages: {response.text}")
