@@ -3136,116 +3136,235 @@ def pinecone_slack_upload():
             "message": f"failed_to_process_slack_transcript: {str(e)}"
         }), 500
 
-@app.post("/api/pinecone_slack_upload_batch")
-@require_solari_key
-def pinecone_slack_upload_batch_start():
-    """
-    Start a batch Pinecone upload for Slack channels.
 
-    Expected request body:
+@app.post("/api/slack/add_channels")  # feel free to keep your old route if you want
+@require_solari_key
+def slack_add_channels_enqueue():
+    """
+    Enqueue Slack ingestion job (v1.5).
+
+    Request body:
     {
-        "uid": "...",
-        "agent_id": "...",
-        "namespace": "...",
-        "chunk_n": 20,     # optional
-        "overlap_n": 5,    # optional
-        "channels": [
-            {"channel_id": "...", "channel_name": "...", "nickname": "..." }
-        ]
+      "uid": "firebase_uid",
+      "agent_id": "agent_id",
+      "channels": [
+        {"channel_id": "C123", "channel_name": "general", "nickname": "Company General"},
+        {"channel_id": "C456", "channel_name": "sales", "nickname": ""}
+      ]
     }
+
+    Notes:
+    - team_id is derived from uid (never accepted from client)
+    - background worker will derive namespace from team_id
+    - chunking params are worker constants
     """
     payload = request.get_json(silent=True) or {}
-    uid = payload.get("uid")
-    agent_id = payload.get("agent_id") or payload.get("agentId")
-    namespace = payload.get("namespace")
-    channels = payload.get("channels") or []
-    chunk_n = int(payload.get("chunk_n", 20))
-    overlap_n = int(payload.get("overlap_n", 5))
 
-    if not uid or not agent_id or not namespace:
-        return jsonify({"ok": False, "error": "missing_uid_agent_id_or_namespace"}), 400
-    if not isinstance(channels, list) or len(channels) == 0:
+    uid = (payload.get("uid") or payload.get("user_id") or "").strip()
+    agent_id = (payload.get("agent_id") or payload.get("agentId") or "").strip()
+    channels = payload.get("channels") or []
+
+    if not uid or not agent_id:
+        return jsonify({"ok": False, "error": "missing_uid_or_agent_id"}), 400
+    if not isinstance(channels, list) or not channels:
         return jsonify({"ok": False, "error": "missing_channels"}), 400
 
-    normalized = []
-    seen = set()
+    db = firestore.client()
+    now = datetime.now(timezone.utc)
+
+    # ✅ Always derive team_id from uid
+    try:
+        team_id = get_team_id_for_uid(db, uid)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "team_id_not_found", "details": str(e)}), 404
+
+    # Normalize channels (dedupe within request)
+    sources = []
+    seen_channel_ids = set()
+
     for c in channels:
         if not isinstance(c, dict):
             continue
-        channel_id = (c.get("channel_id") or c.get("channelId") or "").strip()
-        channel_name = (c.get("channel_name") or c.get("channelName") or "").strip()
+
+        channel_id = (c.get("channel_id") or c.get("channelId") or c.get("id") or "").strip()
+        channel_name = (c.get("channel_name") or c.get("channelName") or c.get("name") or "").strip()
         nickname = (c.get("nickname") or "").strip()
-        if not channel_id or not channel_name:
+
+        if not channel_id:
             continue
-        key = (channel_id, channel_name)
-        if key in seen:
+        if channel_id in seen_channel_ids:
             continue
-        seen.add(key)
-        normalized.append({
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "nickname": nickname,
+        seen_channel_ids.add(channel_id)
+
+        sources.append({
+            "source_key": f"slack:{channel_id}",
+            "type": "slack",
+            "id": channel_id,
+            "title": f"#{channel_name}" if channel_name else f"Slack {channel_id}",
+            "channel_name": channel_name or None,
+            "nickname": nickname or None,
+
             "status": "queued",
-            "started_at": None,
-            "finished_at": None,
-            "result": None,
+            "stage": "queued",
+            "checkpoint": {
+                # worker can optionally store paging / embed progress here later
+                "last_synced_ts": None,
+                "last_embedded_ts": None,
+            },
             "error": None,
+            "updated_at": now,
         })
 
-    if not normalized:
+    if not sources:
         return jsonify({"ok": False, "error": "no_valid_channels"}), 400
 
-    batch_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") + "_" + uuid.uuid4().hex[:8]
-    now_unix = int(time.time())
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30)
 
-    try:
-        team_user_ref, _ = get_team_user_ref(db, uid)
-    except KeyError as e:
-        return jsonify({"ok": False, "error": str(e)}), 404
-
-    batch_ref = (
-        team_user_ref.collection("agents").document(agent_id)
-          .collection("slack_pinecone_batches").document(batch_id)
+    job_id = uuid.uuid4().hex
+    job_ref = (
+        db.collection("teams").document(team_id)
+          .collection("upload_jobs").document(job_id)
     )
 
-    doc = {
-        "batch_id": batch_id,
-        "uid": uid,
-        "agent_id": agent_id,
-        "provider": "slack",
-        "status": "running",
+    job_ref.set({
+        "job_type": "ingest_sources",
+        "connector": "slack",
+        "status": "queued",
         "created_at": firestore.SERVER_TIMESTAMP,
-        "started_at_unix": now_unix,
-        "finished_at_unix": None,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": expires_at,
 
-        "namespace": namespace,
-        "chunk_n": chunk_n,
-        "overlap_n": overlap_n,
+        "locked_by": None,
+        "locked_until": None,
 
-        "total": len(normalized),
-        "completed": 0,
-        "failed": 0,
+        "progress": 0,
+        "message": "Queued",
 
-        "queue": normalized,
-        "cursor": 0,
-        "last_tick_at_unix": None,
-    }
+        "created_by_user_id": uid,
+        "team_id": team_id,
+        "agent_id": agent_id,
 
-    try:
-        batch_ref.set(doc)
-    except Exception as e:
-        return jsonify({"ok": False, "error": "firestore_write_failed", "details": str(e)}), 500
+        "sources": sources,
+    })
 
     return jsonify({
         "ok": True,
-        "batch_id": batch_id,
-        "total": len(normalized),
-        "status": "running",
-        "next": {
-            "tick_endpoint": "/api/pinecone_slack_upload_batch/tick",
-            "status_endpoint": "/api/pinecone_slack_upload_batch/status",
-        }
-    })
+        "job_id": job_id,
+        "team_id": team_id,
+        "queued_sources": len(sources),
+        "status": "queued",
+    }), 200
+# @app.post("/api/pinecone_slack_upload_batch")
+# @require_solari_key
+# def pinecone_slack_upload_batch_start():
+#     """
+#     Start a batch Pinecone upload for Slack channels.
+
+#     Expected request body:
+#     {
+#         "uid": "...",
+#         "agent_id": "...",
+#         "namespace": "...",
+#         "chunk_n": 20,     # optional
+#         "overlap_n": 5,    # optional
+#         "channels": [
+#             {"channel_id": "...", "channel_name": "...", "nickname": "..." }
+#         ]
+#     }
+#     """
+#     payload = request.get_json(silent=True) or {}
+#     uid = payload.get("uid")
+#     agent_id = payload.get("agent_id") or payload.get("agentId")
+#     namespace = payload.get("namespace")
+#     channels = payload.get("channels") or []
+#     chunk_n = int(payload.get("chunk_n", 20))
+#     overlap_n = int(payload.get("overlap_n", 5))
+
+#     if not uid or not agent_id or not namespace:
+#         return jsonify({"ok": False, "error": "missing_uid_agent_id_or_namespace"}), 400
+#     if not isinstance(channels, list) or len(channels) == 0:
+#         return jsonify({"ok": False, "error": "missing_channels"}), 400
+
+#     normalized = []
+#     seen = set()
+#     for c in channels:
+#         if not isinstance(c, dict):
+#             continue
+#         channel_id = (c.get("channel_id") or c.get("channelId") or "").strip()
+#         channel_name = (c.get("channel_name") or c.get("channelName") or "").strip()
+#         nickname = (c.get("nickname") or "").strip()
+#         if not channel_id or not channel_name:
+#             continue
+#         key = (channel_id, channel_name)
+#         if key in seen:
+#             continue
+#         seen.add(key)
+#         normalized.append({
+#             "channel_id": channel_id,
+#             "channel_name": channel_name,
+#             "nickname": nickname,
+#             "status": "queued",
+#             "started_at": None,
+#             "finished_at": None,
+#             "result": None,
+#             "error": None,
+#         })
+
+#     if not normalized:
+#         return jsonify({"ok": False, "error": "no_valid_channels"}), 400
+
+#     batch_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") + "_" + uuid.uuid4().hex[:8]
+#     now_unix = int(time.time())
+
+#     try:
+#         team_user_ref, _ = get_team_user_ref(db, uid)
+#     except KeyError as e:
+#         return jsonify({"ok": False, "error": str(e)}), 404
+
+#     batch_ref = (
+#         team_user_ref.collection("agents").document(agent_id)
+#           .collection("slack_pinecone_batches").document(batch_id)
+#     )
+
+#     doc = {
+#         "batch_id": batch_id,
+#         "uid": uid,
+#         "agent_id": agent_id,
+#         "provider": "slack",
+#         "status": "running",
+#         "created_at": firestore.SERVER_TIMESTAMP,
+#         "started_at_unix": now_unix,
+#         "finished_at_unix": None,
+
+#         "namespace": namespace,
+#         "chunk_n": chunk_n,
+#         "overlap_n": overlap_n,
+
+#         "total": len(normalized),
+#         "completed": 0,
+#         "failed": 0,
+
+#         "queue": normalized,
+#         "cursor": 0,
+#         "last_tick_at_unix": None,
+#     }
+
+#     try:
+#         batch_ref.set(doc)
+#     except Exception as e:
+#         return jsonify({"ok": False, "error": "firestore_write_failed", "details": str(e)}), 500
+
+#     return jsonify({
+#         "ok": True,
+#         "batch_id": batch_id,
+#         "total": len(normalized),
+#         "status": "running",
+#         "next": {
+#             "tick_endpoint": "/api/pinecone_slack_upload_batch/tick",
+#             "status_endpoint": "/api/pinecone_slack_upload_batch/status",
+#         }
+#     })
 
 @app.get("/api/pinecone_slack_upload_batch/status")
 @require_solari_key

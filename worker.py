@@ -36,7 +36,8 @@ from app import (
     confluence_storage_html_to_rag_text,
     get_openai_client,
     _get_team_pinecone_namespace,
-)
+    pinecone_slack_upload_internal
+    )
 
 # ======================
 # TIME HELPERS
@@ -69,19 +70,125 @@ def fetch_confluence_storage_html_for_worker(user_id: str, page_id: str) -> str:
     body = (page.get("body") or {}).get("storage") or {}
     return body.get("value") or ""
 
+def process_slack_source(db, job_ref, job, source):
+    team_id = job["team_id"]
+    agent_id = job["agent_id"]
+    uid = job["created_by_user_id"]
+
+    channel_id = source.get("id")  # your upload_jobs uses "id" for the channel id
+    channel_name = source.get("channel_name") or source.get("title")  # either is fine
+    nickname = source.get("nickname") or ""
+
+    source_key = source.get("source_key") or f"slack:{channel_id}"
+
+    # Mark source as processing (uses your existing helper)
+    update_source(job_ref, source_key, {
+        "status": "processing",
+        "stage": "sync_and_embed",
+        "error": None,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+
+    namespace = _get_team_pinecone_namespace(db, team_id)
+
+    # Reuse your existing Slack ingestion+embedding logic
+    result = pinecone_slack_upload_internal(
+        db=db,
+        uid=uid,
+        agent_id=agent_id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        namespace=namespace,
+        nickname=nickname,
+        chunk_n=20,
+        overlap_n=5,
+        team_id=None,              # derive internally / ok to pass None
+        source_id=channel_id,
+    )
+
+    if not result.get("ok"):
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "error",
+            "error": result.get("error") or "slack_ingest_failed",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        return
+
+    update_source(job_ref, source_key, {
+        "status": "done",
+        "stage": "done",
+        "error": None,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+
 # ======================
 # FIRESTORE JOB HELPERS
 # ======================
 
+# def claim_next_job(db):
+#     query = (
+#         db.collection_group("upload_jobs")
+#           .where("status", "==", "queued")
+#           .order_by("created_at")
+#           .limit(1)
+#     )
+
+#     docs = list(query.stream())
+#     if not docs:
+#         return None
+
+#     job_ref = docs[0].reference
+
+#     @firestore.transactional
+#     def txn_claim(txn):
+#         snap = job_ref.get(transaction=txn)
+#         data = snap.to_dict() or {}
+
+#         if data.get("status") != "queued":
+#             return False
+
+#         locked_until = data.get("locked_until")
+#         if locked_until and locked_until > utcnow():
+#             return False
+
+#         txn.update(job_ref, {
+#             "status": "processing",
+#             "locked_by": WORKER_ID,
+#             "locked_until": utcnow() + timedelta(seconds=LEASE_SECONDS),
+#             "message": "Processing",
+#             "progress": 0,
+#             "updated_at": firestore.SERVER_TIMESTAMP,
+#         })
+#         return True
+
+#     txn = db.transaction()
+#     ok = txn_claim(txn)
+#     return job_ref if ok else None
+
 def claim_next_job(db):
-    query = (
+    now = utcnow()
+
+    # 1) Prefer queued
+    queued_q = (
         db.collection_group("upload_jobs")
           .where("status", "==", "queued")
           .order_by("created_at")
           .limit(1)
     )
+    docs = list(queued_q.stream())
 
-    docs = list(query.stream())
+    # 2) Otherwise reclaim expired leases
+    if not docs:
+        expired_q = (
+            db.collection_group("upload_jobs")
+              .where("status", "==", "processing")
+              .where("locked_until", "<=", now)
+              .order_by("locked_until")
+              .limit(1)
+        )
+        docs = list(expired_q.stream())
+
     if not docs:
         return None
 
@@ -92,26 +199,24 @@ def claim_next_job(db):
         snap = job_ref.get(transaction=txn)
         data = snap.to_dict() or {}
 
-        if data.get("status") != "queued":
+        status = data.get("status")
+        if status not in ("queued", "processing"):
             return False
 
         locked_until = data.get("locked_until")
-        if locked_until and locked_until > utcnow():
+        if locked_until and locked_until > now:
             return False
 
         txn.update(job_ref, {
             "status": "processing",
             "locked_by": WORKER_ID,
-            "locked_until": utcnow() + timedelta(seconds=LEASE_SECONDS),
+            "locked_until": now + timedelta(seconds=LEASE_SECONDS),
             "message": "Processing",
-            "progress": 0,
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": now,
         })
         return True
 
-    txn = db.transaction()
-    ok = txn_claim(txn)
-    return job_ref if ok else None
+    return job_ref if txn_claim(db.transaction()) else None
 
 def renew_lease(job_ref):
     job_ref.update({
@@ -295,6 +400,10 @@ def process_job(db, job_ref):
 
         if source["type"] == "confluence":
             process_confluence_source(db, job_ref, job, source)
+            completed += 1
+            
+        if source["type"] == "slack":
+            process_slack_source(db, job_ref, job, source)
             completed += 1
 
         update_job(
