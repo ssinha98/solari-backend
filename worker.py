@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from google.cloud import firestore
+from firebase_admin import firestore
 
 # ======================
 # ENV CONFIG
