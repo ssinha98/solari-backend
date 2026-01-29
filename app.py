@@ -126,7 +126,7 @@ def get_all_env_vars() -> dict:
     return dict(os.environ)
 
 # Jira OAuth Configuration
-ATLASSIAN_REDIRECT_URI = 'https://app.useaolari.ai/auth/jira/callback'
+ATLASSIAN_REDIRECT_URI = "https://api.usesolari.ai/auth/jira/callback"
 FRONTEND_SUCCESS_URL = os.getenv('FRONTEND_SUCCESS_URL', 'http://localhost:3000')
 
 # Security: Solari Key validation
@@ -6836,255 +6836,353 @@ def upload_string_to_firebase_storage(storage_path: str, content: str, content_t
 # Updated endpoint
 # -------------------------
 
+# @app.route("/api/confluence/add_pages", methods=["POST"])
+# @require_solari_key
 @app.route("/api/confluence/add_pages", methods=["POST"])
 @require_solari_key
 def confluence_add_pages():
     """
-    Add Confluence pages as sources for agent + team scopes, save raw+processed to Storage,
-    and upload processed text to Pinecone (chunked/embedded).
-
-    Request Body:
-    {
-      "user_id": "firebase_uid",
-      "team_id": "team_id",              # optional (derived if missing)
-      "agent_id": "agent_id",
-      "nickname": "confluence",          # optional, default "confluence" for now
-      "pages": [
-        {
-          "id": "327682",
-          "title": "2025-10-07 Meeting notes",
-          "tinyui_path": "/x/AgAF",
-          "excerpt": "optional preview text",
-          "url": "https://.../wiki/x/AgAF"
-        }
-      ],
-      "chunk_size": 1000,                # optional
-      "chunk_overlap": 200               # optional
-    }
+    Enqueue Confluence ingestion job (v1.5).
     """
-    try:
-        body = request.get_json(force=True) or {}
+    body = request.get_json(force=True) or {}
 
-        user_id = body.get("user_id")
-        team_id = body.get("team_id") or body.get("teamId")
-        agent_id = body.get("agent_id")
-        pages = body.get("pages")
+    user_id = body.get("user_id")
+    team_id = body.get("team_id") or body.get("teamId")
+    agent_id = body.get("agent_id")
+    pages = body.get("pages")
 
-        chunk_size = int(body.get("chunk_size", 1000))
-        chunk_overlap = int(body.get("chunk_overlap", 200))
+    chunk_size = int(body.get("chunk_size", 1000))
+    chunk_overlap = int(body.get("chunk_overlap", 200))
 
-        if not user_id:
-            return jsonify({"status": "failure", "error": "user_id is required"}), 400
-        if not agent_id:
-            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
-        if not isinstance(pages, list) or not pages:
-            return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    if not agent_id:
+        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+    if not isinstance(pages, list) or not pages:
+        return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
 
-        db = firestore.client()
-        if not team_id:
-            team_id = get_team_id_for_uid(db, user_id)
-        namespace = _get_team_pinecone_namespace(db, team_id)
+    db = firestore.client()
+    if not team_id:
+        team_id = get_team_id_for_uid(db, user_id)
 
-        agent_sources_ref = (
-            db.collection("teams").document(team_id)
-              .collection("agents").document(agent_id)
-              .collection("sources")
-        )
-        team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+    # Build sources array
+    sources = []
+    for page in pages:
+        if not isinstance(page, dict):
+            return jsonify({"status": "failure", "error": "each page must be an object"}), 400
 
-        openai_client = get_openai_client()
+        page_id = page.get("id")
+        title = page.get("title")
+        tinyui_path = page.get("tinyui_path")
+        url = page.get("url")
+        excerpt = page.get("excerpt")
 
-        added = 0
-        pinecone_uploaded_total = 0
+        if not page_id or not title:
+            return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
 
-        for page in pages:
-            if not isinstance(page, dict):
-                return jsonify({"status": "failure", "error": "each page must be an object"}), 400
+        sources.append({
+            "source_key": f"confluence:{page_id}",
+            "type": "confluence",
+            "id": page_id,
+            "title": title,
+            "tinyui_path": tinyui_path,
+            "url": url,
+            "excerpt": excerpt,
+            "status": "queued",
+            "stage": "queued",
+            "checkpoint": {
+                "chunk_index": 0,
+                "total_chunks": None,
+                "page_version": None,
+            },
+            "error": None,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
 
-            page_id = page.get("id")
-            title = page.get("title")
-            tinyui_path = page.get("tinyui_path")
-            url = page.get("url")
-            body_preview = page.get("excerpt")
-            nickname = title
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30)
 
-            if not page_id or not title:
-                return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
+    job_id = uuid.uuid4().hex
+    job_ref = (
+        db.collection("teams").document(team_id)
+          .collection("upload_jobs").document(job_id)
+    )
 
-            logger.info(f"Adding Confluence page source: id={page_id}, title={title}, url={url}")
+    job_ref.set({
+        "job_type": "ingest_sources",
+        "connector": "confluence",
+        "status": "queued",
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": expires_at,  # Firestore TTL field
+        "locked_by": None,
+        "locked_until": None,
+        "progress": 0,
+        "message": "Queued",
+        "created_by_user_id": user_id,
 
-            # 1) Fetch Confluence storage HTML via internal endpoint
-            storage_html = ""
-            try:
-                base_url = request.host_url.rstrip("/")
-                solari_key = request.headers.get(SOLARI_KEY_HEADER)
-                storage_html = _fetch_confluence_page_storage_body(user_id, page_id, base_url, solari_key)
-            except Exception as e:
-                logger.warning(f"Failed to fetch Confluence page body for {page_id}: {str(e)}")
-                storage_html = ""
+        # context
+        "team_id": team_id,
+        "agent_id": agent_id,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
 
-            # 2) Convert to RAG-friendly text
-            processed_text = confluence_storage_html_to_rag_text(storage_html) if storage_html else ""
+        "sources": sources,
+    })
 
-            # 3) Upsert team-level source doc (and get its Firestore doc id = source_id)
-            team_match = team_sources_ref.where("id", "==", page_id).limit(1).stream()
-            team_doc = next(team_match, None)
+    return jsonify({
+        "status": "success",
+        "job_id": job_id,
+        "team_id": team_id,
+        "queued_sources": len(sources),
+    }), 200
+# def confluence_add_pages():
+#     """
+#     Add Confluence pages as sources for agent + team scopes, save raw+processed to Storage,
+#     and upload processed text to Pinecone (chunked/embedded).
 
-            if team_doc:
-                team_source_id = team_doc.id
-                team_sources_ref.document(team_source_id).update({
-                    "title": title,
-                    "id": page_id,
-                    "tinyui_path": tinyui_path,
-                    "url": url,
-                    "type": "confluence",
-                    "bodyPreview": body_preview,
-                    "nickname": nickname,
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                    "agents": firestore.ArrayUnion([agent_id]),
-                    # NOTE: we no longer store raw html directly in Firestore (too big)
-                })
-            else:
-                new_ref = team_sources_ref.document()  # allocate id so we can use it in storage paths
-                team_source_id = new_ref.id
-                new_ref.set({
-                    "title": title,
-                    "id": page_id,
-                    "tinyui_path": tinyui_path,
-                    "url": url,
-                    "type": "confluence",
-                    "bodyPreview": body_preview,
-                    "nickname": nickname,
-                    "createdAt": firestore.SERVER_TIMESTAMP,
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                    "agents": [agent_id],
-                })
+#     Request Body:
+#     {
+#       "user_id": "firebase_uid",
+#       "team_id": "team_id",              # optional (derived if missing)
+#       "agent_id": "agent_id",
+#       "nickname": "confluence",          # optional, default "confluence" for now
+#       "pages": [
+#         {
+#           "id": "327682",
+#           "title": "2025-10-07 Meeting notes",
+#           "tinyui_path": "/x/AgAF",
+#           "excerpt": "optional preview text",
+#           "url": "https://.../wiki/x/AgAF"
+#         }
+#       ],
+#       "chunk_size": 1000,                # optional
+#       "chunk_overlap": 200               # optional
+#     }
+#     """
+#     try:
+#         body = request.get_json(force=True) or {}
 
-            # 4) Upsert agent-level source doc (still keyed by Confluence page id)
-            agent_match = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
-            agent_doc = next(agent_match, None)
+#         user_id = body.get("user_id")
+#         team_id = body.get("team_id") or body.get("teamId")
+#         agent_id = body.get("agent_id")
+#         pages = body.get("pages")
 
-            agent_payload = {
-                "title": title,
-                "id": page_id,
-                "tinyui_path": tinyui_path,
-                "url": url,
-                "type": "confluence_page",
-                "bodyPreview": body_preview,
-                "nickname": nickname,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            }
+#         chunk_size = int(body.get("chunk_size", 1000))
+#         chunk_overlap = int(body.get("chunk_overlap", 200))
 
-            if agent_doc:
-                agent_sources_ref.document(agent_doc.id).update(agent_payload)
-            else:
-                agent_payload["createdAt"] = firestore.SERVER_TIMESTAMP
-                agent_sources_ref.add(agent_payload)
+#         if not user_id:
+#             return jsonify({"status": "failure", "error": "user_id is required"}), 400
+#         if not agent_id:
+#             return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+#         if not isinstance(pages, list) or not pages:
+#             return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
 
-            # 5) Save raw + processed to Firebase Storage (under the TEAM source doc)
-            # Paths are deterministic and easy to find later.
-            raw_path = f"teams/{team_id}/sources/{team_source_id}/confluence/pages/{page_id}/raw_storage.html"
-            processed_path = f"teams/{team_id}/sources/{team_source_id}/confluence/pages/{page_id}/processed.txt"
+#         db = firestore.client()
+#         if not team_id:
+#             team_id = get_team_id_for_uid(db, user_id)
+#         namespace = _get_team_pinecone_namespace(db, team_id)
 
-            raw_gs_url = ""
-            processed_gs_url = ""
+#         agent_sources_ref = (
+#             db.collection("teams").document(team_id)
+#               .collection("agents").document(agent_id)
+#               .collection("sources")
+#         )
+#         team_sources_ref = db.collection("teams").document(team_id).collection("sources")
 
-            if storage_html:
-                raw_gs_url = upload_string_to_firebase_storage(raw_path, storage_html, content_type="text/html")
+#         openai_client = get_openai_client()
 
-            if processed_text:
-                processed_gs_url = upload_string_to_firebase_storage(processed_path, processed_text, content_type="text/plain")
+#         added = 0
+#         pinecone_uploaded_total = 0
 
-            # Save pointers back to Firestore team source doc
-            team_sources_ref.document(team_source_id).update({
-                "title": title,
-                "id": page_id,
-                "tinyui_path": tinyui_path,
-                "url": url,
-                "type": "confluence",
-                "bodyPreview": body_preview,
-                "nickname": nickname,
-                "rawStoragePath": raw_path if storage_html else None,
-                "rawStorageUrl": raw_gs_url if raw_gs_url else None,
-                "processedTextPath": processed_path if processed_text else None,
-                "processedTextUrl": processed_gs_url if processed_gs_url else None,
-                "rawPath": raw_path if storage_html else None,
-                "processedPath": processed_path if processed_text else None,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            })
+#         for page in pages:
+#             if not isinstance(page, dict):
+#                 return jsonify({"status": "failure", "error": "each page must be an object"}), 400
 
-            # Save pointers to agent source doc as well
-            if agent_doc:
-                agent_doc_id = agent_doc.id
-            else:
-                # If agent doc was just created, it won't have id here; re-query
-                agent_match_latest = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
-                agent_doc_latest = next(agent_match_latest, None)
-                agent_doc_id = agent_doc_latest.id if agent_doc_latest else None
+#             page_id = page.get("id")
+#             title = page.get("title")
+#             tinyui_path = page.get("tinyui_path")
+#             url = page.get("url")
+#             body_preview = page.get("excerpt")
+#             nickname = title
 
-            if agent_doc_id:
-                agent_sources_ref.document(agent_doc_id).update({
-                    "title": title,
-                    "id": page_id,
-                    "tinyui_path": tinyui_path,
-                    "url": url,
-                    "type": "confluence_page",
-                    "bodyPreview": body_preview,
-                    "nickname": nickname,
-                    "rawStoragePath": raw_path if storage_html else None,
-                    "rawStorageUrl": raw_gs_url if raw_gs_url else None,
-                    "processedTextPath": processed_path if processed_text else None,
-                    "processedTextUrl": processed_gs_url if processed_gs_url else None,
-                    "rawPath": raw_path if storage_html else None,
-                    "processedPath": processed_path if processed_text else None,
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                })
+#             if not page_id or not title:
+#                 return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
 
-            # 6) Chunk/embed processed text and upload to Pinecone
-            if processed_text.strip():
-                text_chunks = chunk_text(processed_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                embeddings = generate_embeddings(text_chunks, openai_client)
+#             logger.info(f"Adding Confluence page source: id={page_id}, title={title}, url={url}")
 
-                vectors = []
-                for i, (chunk, emb) in enumerate(zip(text_chunks, embeddings)):
-                    vectors.append({
-                        "id": f"confluence_{team_source_id}_{page_id}_chunk_{i}",
-                        "values": emb,
-                        "metadata": {
-                            "source": "confluence",
-                            "nickname": nickname,
-                            "confluence_page_id": page_id,
-                            "source_id": team_source_id,  # Firestore doc id (team source doc)
-                            "text_preview": chunk[:500],
-                        }
-                    })
+#             # 1) Fetch Confluence storage HTML via internal endpoint
+#             storage_html = ""
+#             try:
+#                 base_url = request.host_url.rstrip("/")
+#                 solari_key = request.headers.get(SOLARI_KEY_HEADER)
+#                 storage_html = _fetch_confluence_page_storage_body(user_id, page_id, base_url, solari_key)
+#             except Exception as e:
+#                 logger.warning(f"Failed to fetch Confluence page body for {page_id}: {str(e)}")
+#                 storage_html = ""
 
-                uploaded = upload_vectors_to_pinecone(
-                    vectors=vectors,
-                    namespace=namespace,
-                    index_name="production",
-                    batch_size=100
-                )
-                pinecone_uploaded_total += uploaded
-            else:
-                logger.info(f"No processed text for Confluence page {page_id}; skipping Pinecone upload.")
+#             # 2) Convert to RAG-friendly text
+#             processed_text = confluence_storage_html_to_rag_text(storage_html) if storage_html else ""
 
-            added += 1
+#             # 3) Upsert team-level source doc (and get its Firestore doc id = source_id)
+#             team_match = team_sources_ref.where("id", "==", page_id).limit(1).stream()
+#             team_doc = next(team_match, None)
 
-        return jsonify({
-            "status": "success",
-            "pages_added": added,
-            "pinecone_vectors_uploaded": pinecone_uploaded_total,
-            "namespace": namespace,
-            "nickname": nickname,
-        }), 200
+#             if team_doc:
+#                 team_source_id = team_doc.id
+#                 team_sources_ref.document(team_source_id).update({
+#                     "title": title,
+#                     "id": page_id,
+#                     "tinyui_path": tinyui_path,
+#                     "url": url,
+#                     "type": "confluence",
+#                     "bodyPreview": body_preview,
+#                     "nickname": nickname,
+#                     "updatedAt": firestore.SERVER_TIMESTAMP,
+#                     "agents": firestore.ArrayUnion([agent_id]),
+#                     # NOTE: we no longer store raw html directly in Firestore (too big)
+#                 })
+#             else:
+#                 new_ref = team_sources_ref.document()  # allocate id so we can use it in storage paths
+#                 team_source_id = new_ref.id
+#                 new_ref.set({
+#                     "title": title,
+#                     "id": page_id,
+#                     "tinyui_path": tinyui_path,
+#                     "url": url,
+#                     "type": "confluence",
+#                     "bodyPreview": body_preview,
+#                     "nickname": nickname,
+#                     "createdAt": firestore.SERVER_TIMESTAMP,
+#                     "updatedAt": firestore.SERVER_TIMESTAMP,
+#                     "agents": [agent_id],
+#                 })
 
-    except KeyError as e:
-        logger.error(f"Confluence add pages error: {str(e)}")
-        return jsonify({"status": "failure", "error": str(e)}), 400
-    except Exception as e:
-        logger.error(f"Confluence add pages error: {str(e)}", exc_info=True)
-        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
+#             # 4) Upsert agent-level source doc (still keyed by Confluence page id)
+#             agent_match = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
+#             agent_doc = next(agent_match, None)
+
+#             agent_payload = {
+#                 "title": title,
+#                 "id": page_id,
+#                 "tinyui_path": tinyui_path,
+#                 "url": url,
+#                 "type": "confluence_page",
+#                 "bodyPreview": body_preview,
+#                 "nickname": nickname,
+#                 "updatedAt": firestore.SERVER_TIMESTAMP,
+#             }
+
+#             if agent_doc:
+#                 agent_sources_ref.document(agent_doc.id).update(agent_payload)
+#             else:
+#                 agent_payload["createdAt"] = firestore.SERVER_TIMESTAMP
+#                 agent_sources_ref.add(agent_payload)
+
+#             # 5) Save raw + processed to Firebase Storage (under the TEAM source doc)
+#             # Paths are deterministic and easy to find later.
+#             raw_path = f"teams/{team_id}/sources/{team_source_id}/confluence/pages/{page_id}/raw_storage.html"
+#             processed_path = f"teams/{team_id}/sources/{team_source_id}/confluence/pages/{page_id}/processed.txt"
+
+#             raw_gs_url = ""
+#             processed_gs_url = ""
+
+#             if storage_html:
+#                 raw_gs_url = upload_string_to_firebase_storage(raw_path, storage_html, content_type="text/html")
+
+#             if processed_text:
+#                 processed_gs_url = upload_string_to_firebase_storage(processed_path, processed_text, content_type="text/plain")
+
+#             # Save pointers back to Firestore team source doc
+#             team_sources_ref.document(team_source_id).update({
+#                 "title": title,
+#                 "id": page_id,
+#                 "tinyui_path": tinyui_path,
+#                 "url": url,
+#                 "type": "confluence",
+#                 "bodyPreview": body_preview,
+#                 "nickname": nickname,
+#                 "rawStoragePath": raw_path if storage_html else None,
+#                 "rawStorageUrl": raw_gs_url if raw_gs_url else None,
+#                 "processedTextPath": processed_path if processed_text else None,
+#                 "processedTextUrl": processed_gs_url if processed_gs_url else None,
+#                 "rawPath": raw_path if storage_html else None,
+#                 "processedPath": processed_path if processed_text else None,
+#                 "updatedAt": firestore.SERVER_TIMESTAMP,
+#             })
+
+#             # Save pointers to agent source doc as well
+#             if agent_doc:
+#                 agent_doc_id = agent_doc.id
+#             else:
+#                 # If agent doc was just created, it won't have id here; re-query
+#                 agent_match_latest = agent_sources_ref.where("id", "==", page_id).limit(1).stream()
+#                 agent_doc_latest = next(agent_match_latest, None)
+#                 agent_doc_id = agent_doc_latest.id if agent_doc_latest else None
+
+#             if agent_doc_id:
+#                 agent_sources_ref.document(agent_doc_id).update({
+#                     "title": title,
+#                     "id": page_id,
+#                     "tinyui_path": tinyui_path,
+#                     "url": url,
+#                     "type": "confluence_page",
+#                     "bodyPreview": body_preview,
+#                     "nickname": nickname,
+#                     "rawStoragePath": raw_path if storage_html else None,
+#                     "rawStorageUrl": raw_gs_url if raw_gs_url else None,
+#                     "processedTextPath": processed_path if processed_text else None,
+#                     "processedTextUrl": processed_gs_url if processed_gs_url else None,
+#                     "rawPath": raw_path if storage_html else None,
+#                     "processedPath": processed_path if processed_text else None,
+#                     "updatedAt": firestore.SERVER_TIMESTAMP,
+#                 })
+
+#             # 6) Chunk/embed processed text and upload to Pinecone
+#             if processed_text.strip():
+#                 text_chunks = chunk_text(processed_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+#                 embeddings = generate_embeddings(text_chunks, openai_client)
+
+#                 vectors = []
+#                 for i, (chunk, emb) in enumerate(zip(text_chunks, embeddings)):
+#                     vectors.append({
+#                         "id": f"confluence_{team_source_id}_{page_id}_chunk_{i}",
+#                         "values": emb,
+#                         "metadata": {
+#                             "source": "confluence",
+#                             "nickname": nickname,
+#                             "confluence_page_id": page_id,
+#                             "source_id": team_source_id,  # Firestore doc id (team source doc)
+#                             "text_preview": chunk[:500],
+#                         }
+#                     })
+
+#                 uploaded = upload_vectors_to_pinecone(
+#                     vectors=vectors,
+#                     namespace=namespace,
+#                     index_name="production",
+#                     batch_size=100
+#                 )
+#                 pinecone_uploaded_total += uploaded
+#             else:
+#                 logger.info(f"No processed text for Confluence page {page_id}; skipping Pinecone upload.")
+
+#             added += 1
+
+#         return jsonify({
+#             "status": "success",
+#             "pages_added": added,
+#             "pinecone_vectors_uploaded": pinecone_uploaded_total,
+#             "namespace": namespace,
+#             "nickname": nickname,
+#         }), 200
+
+#     except KeyError as e:
+#         logger.error(f"Confluence add pages error: {str(e)}")
+#         return jsonify({"status": "failure", "error": str(e)}), 400
+#     except Exception as e:
+#         logger.error(f"Confluence add pages error: {str(e)}", exc_info=True)
+#         return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/api/confluence/delete_page", methods=["POST"])
 @require_solari_key
