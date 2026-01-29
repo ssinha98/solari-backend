@@ -11,7 +11,7 @@ from firebase_admin import firestore
 
 WORKER_ID = "upload-worker-1"
 
-WEB_BASE_URL = "api.usesolari.ai"
+WEB_BASE_URL = "https://api.usesolari.ai"
 SOLARI_INTERNAL_KEY = os.environ["SOLARI_INTERNAL_KEY"]
 
 POLL_SECONDS = float(os.environ.get("JOB_POLL_SECONDS", "2"))
