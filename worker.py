@@ -11,7 +11,7 @@ from google.cloud import firestore
 
 WORKER_ID = "upload-worker-1"
 
-WEB_BASE_URL = os.environ["WEB_BASE_URL"]              # e.g. https://api.usesolari.ai
+WEB_BASE_URL = "api.usesolari.ai"
 SOLARI_INTERNAL_KEY = os.environ["SOLARI_INTERNAL_KEY"]
 
 POLL_SECONDS = float(os.environ.get("JOB_POLL_SECONDS", "2"))
