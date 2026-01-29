@@ -3,7 +3,7 @@ import json
 import io
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, request, make_response, redirect
 from werkzeug.exceptions import BadRequest
@@ -127,6 +127,8 @@ def get_all_env_vars() -> dict:
 
 # Jira OAuth Configuration
 ATLASSIAN_REDIRECT_URI = "https://api.usesolari.ai/auth/jira/callback"
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 200
 FRONTEND_SUCCESS_URL = os.getenv('FRONTEND_SUCCESS_URL', 'http://localhost:3000')
 
 # Security: Solari Key validation
@@ -6844,98 +6846,111 @@ def confluence_add_pages():
     """
     Enqueue Confluence ingestion job (v1.5).
     """
-    body = request.get_json(force=True) or {}
+    try:
+        body = request.get_json(force=True) or {}
 
-    user_id = body.get("user_id")
-    team_id = body.get("team_id") or body.get("teamId")
-    agent_id = body.get("agent_id")
-    pages = body.get("pages")
+        user_id = body.get("user_id")
+        agent_id = body.get("agent_id")
+        pages = body.get("pages")
 
-    chunk_size = int(body.get("chunk_size", 1000))
-    chunk_overlap = int(body.get("chunk_overlap", 200))
+        logger.info(
+            "Confluence add_pages request received",
+            extra={"user_id": user_id, "agent_id": agent_id, "pages_count": len(pages or [])},
+        )
 
-    if not user_id:
-        return jsonify({"status": "failure", "error": "user_id is required"}), 400
-    if not agent_id:
-        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
-    if not isinstance(pages, list) or not pages:
-        return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
+        chunk_size = DEFAULT_CHUNK_SIZE
+        chunk_overlap = DEFAULT_CHUNK_OVERLAP
 
-    db = firestore.client()
-    if not team_id:
+        if not user_id:
+            return jsonify({"status": "failure", "error": "user_id is required"}), 400
+        if not agent_id:
+            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+        if not isinstance(pages, list) or not pages:
+            return jsonify({"status": "failure", "error": "pages must be a non-empty list"}), 400
+
+        db = firestore.client()
         team_id = get_team_id_for_uid(db, user_id)
+        logger.info("Resolved team_id for user", extra={"user_id": user_id, "team_id": team_id})
 
-    # Build sources array
-    sources = []
-    for page in pages:
-        if not isinstance(page, dict):
-            return jsonify({"status": "failure", "error": "each page must be an object"}), 400
+        now = datetime.now(timezone.utc)
+        # Build sources array
+        sources = []
+        for page in pages:
+            if not isinstance(page, dict):
+                return jsonify({"status": "failure", "error": "each page must be an object"}), 400
 
-        page_id = page.get("id")
-        title = page.get("title")
-        tinyui_path = page.get("tinyui_path")
-        url = page.get("url")
-        excerpt = page.get("excerpt")
+            page_id = page.get("id")
+            title = page.get("title")
+            tinyui_path = page.get("tinyui_path")
+            url = page.get("url")
+            excerpt = page.get("excerpt")
 
-        if not page_id or not title:
-            return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
+            if not page_id or not title:
+                return jsonify({"status": "failure", "error": "each page must include id and title"}), 400
 
         sources.append({
-            "source_key": f"confluence:{page_id}",
-            "type": "confluence",
-            "id": page_id,
-            "title": title,
-            "tinyui_path": tinyui_path,
-            "url": url,
-            "excerpt": excerpt,
+                "source_key": f"confluence:{page_id}",
+                "type": "confluence",
+                "id": page_id,
+                "title": title,
+                "tinyui_path": tinyui_path,
+                "url": url,
+                "excerpt": excerpt,
+                "status": "queued",
+                "stage": "queued",
+                "checkpoint": {
+                    "chunk_index": 0,
+                    "total_chunks": None,
+                    "page_version": None,
+                },
+                "error": None,
+            "updated_at": now,
+            })
+
+        expires_at = now + timedelta(days=30)
+
+        job_id = uuid.uuid4().hex
+        job_ref = (
+            db.collection("teams").document(team_id)
+              .collection("upload_jobs").document(job_id)
+        )
+
+        job_ref.set({
+            "job_type": "ingest_sources",
+            "connector": "confluence",
             "status": "queued",
-            "stage": "queued",
-            "checkpoint": {
-                "chunk_index": 0,
-                "total_chunks": None,
-                "page_version": None,
-            },
-            "error": None,
+            "created_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
+            "expires_at": expires_at,  # Firestore TTL field
+            "locked_by": None,
+            "locked_until": None,
+            "progress": 0,
+            "message": "Queued",
+            "created_by_user_id": user_id,
+
+            # context
+            "team_id": team_id,
+            "agent_id": agent_id,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+
+            "sources": sources,
         })
 
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(days=30)
+        logger.info(
+            "Confluence add_pages job queued",
+            extra={"job_id": job_id, "team_id": team_id, "queued_sources": len(sources)},
+        )
 
-    job_id = uuid.uuid4().hex
-    job_ref = (
-        db.collection("teams").document(team_id)
-          .collection("upload_jobs").document(job_id)
-    )
-
-    job_ref.set({
-        "job_type": "ingest_sources",
-        "connector": "confluence",
-        "status": "queued",
-        "created_at": firestore.SERVER_TIMESTAMP,
-        "updated_at": firestore.SERVER_TIMESTAMP,
-        "expires_at": expires_at,  # Firestore TTL field
-        "locked_by": None,
-        "locked_until": None,
-        "progress": 0,
-        "message": "Queued",
-        "created_by_user_id": user_id,
-
-        # context
-        "team_id": team_id,
-        "agent_id": agent_id,
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-
-        "sources": sources,
-    })
-
-    return jsonify({
-        "status": "success",
-        "job_id": job_id,
-        "team_id": team_id,
-        "queued_sources": len(sources),
-    }), 200
+        return jsonify({
+            "status": "success",
+            "job_id": job_id,
+            "team_id": team_id,
+            "queued_sources": len(sources),
+        }), 200
+    except Exception as e:
+        logger.exception("Confluence add_pages failed")
+        return jsonify({"status": "failure", "error": str(e)}), 500
 # def confluence_add_pages():
 #     """
 #     Add Confluence pages as sources for agent + team scopes, save raw+processed to Storage,
