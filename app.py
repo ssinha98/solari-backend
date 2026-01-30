@@ -554,9 +554,18 @@ def extract_text_from_pdf(file_content: bytes) -> str:
     try:
         pdf_file = io.BytesIO(file_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
+        logger.info(f"PDF extraction: pages={len(pdf_reader.pages)}")
         text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
+        for idx, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text() or ""
+            preview = page_text[:200].replace("\n", " ")
+            logger.info(
+                "PDF extraction: page=%d chars=%d preview=%s",
+                idx + 1,
+                len(page_text),
+                preview
+            )
+            text += page_text + "\n"
         return text
     except Exception as e:
         logger.error(f"Error extracting text from PDF: {str(e)}")
@@ -8789,6 +8798,7 @@ def pinecone_slack_upload_internal(
     channel_name = threads_json.get("channel_name") or channel_name or ""
     team_id_used = threads_json.get("team_id") or chunk_meta.get("team_id")
     sync_run_id = threads_json.get("sync_run_id") or chunk_meta.get("sync_run_id")
+    effective_nickname = nickname or channel_name or ""
 
     messages = flatten_slack_transcript(threads_json)
     if not messages:
@@ -8843,7 +8853,7 @@ def pinecone_slack_upload_internal(
             "thread_ts_list": thread_ts_list,
             "text_preview": chunk_text[:500],
             "storage_path_threads": storage_path_threads,
-            "nickname": nickname,
+            "nickname": effective_nickname,
         }
         if min_ts:
             metadata["min_ts"] = min_ts
@@ -8881,7 +8891,7 @@ def pinecone_slack_upload_internal(
         "vectors_uploaded": total_uploaded,
         "chunk_n": chunk_n,
         "overlap_n": overlap_n,
-        "nickname": nickname,
+        "nickname": effective_nickname,
     }
 
 # --- endpoint ---
@@ -8924,17 +8934,8 @@ def _sync_channel_transcript_internal(uid: str, agent_id: str, channel_id: str, 
         last_message_ts = (existing.get("last_message_ts") or "").strip()
         thread_latest_reply_ts = existing.get("thread_latest_reply_ts") or {}
 
-        # Oldest: prefer last_message_ts; fall back to last_synced_at (per your request)
+        # Oldest: disabled for full sync (temporary)
         oldest = None
-        if last_message_ts:
-            oldest = last_message_ts
-        else:
-            last_synced_at = existing.get("last_synced_at")
-            if last_synced_at:
-                try:
-                    oldest = str(last_synced_at.timestamp())
-                except Exception:
-                    oldest = None
 
         sync_run_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") + "_" + uuid.uuid4().hex[:8]
 

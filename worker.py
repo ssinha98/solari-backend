@@ -18,7 +18,7 @@ POLL_SECONDS = float(os.environ.get("JOB_POLL_SECONDS", "2"))
 LEASE_SECONDS = int(os.environ.get("JOB_LEASE_SECONDS", "120"))
 LEASE_RENEW_SECONDS = int(os.environ.get("JOB_LEASE_RENEW_SECONDS", "30"))
 
-DEFAULT_CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1000"))
+DEFAULT_CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 DEFAULT_CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "200"))
 
 # PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "production")
@@ -83,7 +83,7 @@ def process_slack_source(db, job_ref, job, source):
 
     channel_id = source.get("id")  # your upload_jobs uses "id" for the channel id
     channel_name = source.get("channel_name") or source.get("title")  # either is fine
-    nickname = source.get("nickname") or ""
+    nickname = source.get("nickname") or source.get("channel_name")
 
     source_key = source.get("source_key") or f"slack:{channel_id}"
 
