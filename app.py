@@ -4600,8 +4600,8 @@ def analyze_table():
         })
         now_unix = int(utcnow().timestamp())
 
-        update_job(job_ref, status="done", progress=100, message="Completed", updated_at_unix=now_unix)
-        update_job(job_ref, locked_by=None, locked_until=None, updated_at_unix=now_unix)
+        update_job(job_ref, status="done", progress=100, message="Completed")
+        update_job(job_ref, locked_by=None, locked_until=None,)
 
         # --- Return what frontend expects
         return jsonify({
