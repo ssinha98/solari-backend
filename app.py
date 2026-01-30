@@ -4598,6 +4598,8 @@ def analyze_table():
                 "column_count": column_count,
             }
         })
+        now_unix = int(utcnow().timestamp())
+
         update_job(job_ref, status="done", progress=100, message="Completed", updated_at_unix=now_unix)
         update_job(job_ref, locked_by=None, locked_until=None, updated_at_unix=now_unix)
 
