@@ -135,6 +135,7 @@ FRONTEND_SUCCESS_URL = os.getenv('FRONTEND_SUCCESS_URL', 'http://localhost:3000'
 SOLARI_INTERNAL_KEY = os.environ.get("SOLARI_INTERNAL_KEY")
 SOLARI_DEV_KEY = os.environ.get("SOLARI_DEV_KEY")
 SOLARI_KEY_HEADER = "x-solari-key"
+utcnow = datetime.now(timezone.utc)
 
 def _is_valid_solari_key(key: str | None) -> bool:
     if not key:
@@ -3119,105 +3120,103 @@ def scrape_website_with_firecrawl(url: str) -> dict:
         logger.error(f"Error scraping website with Firecrawl: {str(e)}")
         raise ValueError(f"Failed to scrape website: {str(e)}")
 
-# Add this endpoint after the pinecone_doc_upload endpoint (around line 544)
-
 @app.post("/api/website/add_urls")
 @require_solari_key
-def website_add_urls():
+def add_website_urls():
     """
-    Enqueue website ingestion job.
+    Add website URLs to upload_jobs for background processing.
 
     Request body:
     {
       "user_id": "...",
-      "team_id": "...",          # optional (derive if missing)
       "agent_id": "...",
       "sites": [
-        { "url": "https://example.com", "nickname": "optional" }
+        { "url": "https://example.com", "nickname": "Example" }
       ]
     }
     """
     body = request.get_json(force=True) or {}
 
     user_id = body.get("user_id")
-    team_id = body.get("team_id") or body.get("teamId")
     agent_id = body.get("agent_id")
-    sites = body.get("sites") or body.get("urls")  # allow either key
+    sites = body.get("sites")
 
-    if not user_id:
-        return jsonify({"status": "failure", "error": "user_id is required"}), 400
-    if not agent_id:
-        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+    if not user_id or not agent_id:
+        return jsonify({"error": "user_id and agent_id are required"}), 400
     if not isinstance(sites, list) or not sites:
-        return jsonify({"status": "failure", "error": "sites must be a non-empty list"}), 400
+        return jsonify({"error": "sites must be a non-empty list"}), 400
 
     db = firestore.client()
-    if not team_id:
+    now = utcnow()
+
+    try:
         team_id = get_team_id_for_uid(db, user_id)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 404
 
     sources = []
+    seen = set()
+
     for s in sites:
         if not isinstance(s, dict):
-            return jsonify({"status": "failure", "error": "each site must be an object"}), 400
+            continue
 
         url = (s.get("url") or "").strip()
-        nickname = (s.get("nickname") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
 
-        if not url:
-            return jsonify({"status": "failure", "error": "each site must include url"}), 400
-
-        source_key = f"website:{url}"
+        nickname = (s.get("nickname") or url).strip()
 
         sources.append({
-            "source_key": source_key,
             "type": "website",
             "id": url,
-            "title": nickname or url,
-            "url": url,
-            "nickname": nickname or "",
+            "source_key": f"website:{url}",
+            "title": url,
+            "nickname": nickname,
+
+            # worker-controlled fields
             "status": "queued",
             "stage": "queued",
-            "checkpoint": {
-                "chunk_index": 0,
-                "total_chunks": None,
-            },
             "error": None,
-            "updated_at": now,
+            "checkpoint": {},
         })
 
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(days=30)
+    if not sources:
+        return jsonify({"error": "no valid sites"}), 400
 
-    job_id = uuid.uuid4().hex
     job_ref = (
-        db.collection("teams").document(team_id)
-          .collection("upload_jobs").document(job_id)
+        db.collection("teams")
+          .document(team_id)
+          .collection("upload_jobs")
+          .document()
     )
 
-    job_ref.set({
+    job_doc = {
         "job_type": "ingest_sources",
         "connector": "website",
-        "status": "queued",
-        "created_at": firestore.SERVER_TIMESTAMP,
-        "updated_at": firestore.SERVER_TIMESTAMP,
-        "expires_at": expires_at,
-
-        "locked_by": None,
-        "locked_until": None,
-
-        "progress": 0,
-        "message": "Queued",
-        "created_by_user_id": user_id,
 
         "team_id": team_id,
         "agent_id": agent_id,
+        "created_by_user_id": user_id,
+
+        "status": "queued",
+        "message": "Queued",
+        "progress": 0,
+
+        "created_at": now,
+        "updated_at": now,
+        "locked_by": None,
+        "locked_until": None,
 
         "sources": sources,
-    })
+    }
+
+    job_ref.set(job_doc)
 
     return jsonify({
         "status": "success",
-        "job_id": job_id,
+        "job_id": job_ref.id,
         "team_id": team_id,
         "queued_sources": len(sources),
     }), 200
