@@ -36,7 +36,9 @@ from app import (
     confluence_storage_html_to_rag_text,
     get_openai_client,
     _get_team_pinecone_namespace,
-    pinecone_slack_upload_internal
+    pinecone_slack_upload_internal, 
+    _build_jira_ticket_text,
+    _merge_jira_tickets,
     )
 
 # ======================
@@ -379,6 +381,114 @@ def process_confluence_source(db, job_ref, job, source):
     update_source(job_ref, source_key, {"status": "done", "stage": "done"})
 
 # ======================
+# JIRA INGESTION
+# ======================
+def process_jira_source(db, job_ref, job, source):
+    team_id = job["team_id"]
+    agent_id = job["agent_id"]
+
+    now = utcnow()
+
+    # ---- mark source processing ----
+    update_source(job_ref, source["source_key"], {
+        "status": "processing",
+        "stage": "upsert_firestore",
+        "error": None,
+        "updated_at": now,
+    })
+
+    # ---- get ticket payload ----
+    ticket = source.get("ticket") or {}
+    ticket_id = str(source.get("id") or ticket.get("id") or "")
+    if not ticket_id:
+        raise RuntimeError("jira_missing_ticket_id")
+
+    # ---- Upsert agent-level Jira source (single doc with tickets array, as you do today) ----
+    agent_sources_ref = (
+        db.collection("teams").document(team_id)
+          .collection("agents").document(agent_id)
+          .collection("sources")
+    )
+
+    agent_jira_docs = agent_sources_ref.where("type", "==", "jira").limit(1).stream()
+    agent_jira_doc = next(agent_jira_docs, None)
+
+    if agent_jira_doc:
+        existing_agent_tickets = (agent_jira_doc.to_dict() or {}).get("tickets", [])
+        merged = _merge_jira_tickets(existing_agent_tickets, [ticket])
+        agent_sources_ref.document(agent_jira_doc.id).update({
+            "nickname": "jira",
+            "tickets": merged,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+    else:
+        agent_sources_ref.add({
+            "type": "jira",
+            "nickname": "jira",
+            "agent_id": agent_id,
+            "tickets": [ticket],
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    # ---- Upsert team-level Jira source (single doc with tickets array) ----
+    team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+    team_jira_docs = team_sources_ref.where("type", "==", "jira").limit(1).stream()
+    team_jira_doc = next(team_jira_docs, None)
+
+    if team_jira_doc:
+        existing_team_tickets = (team_jira_doc.to_dict() or {}).get("tickets", [])
+        merged = _merge_jira_tickets(existing_team_tickets, [ticket])
+        team_sources_ref.document(team_jira_doc.id).update({
+            "nickname": "jira",
+            "tickets": merged,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+    else:
+        team_sources_ref.add({
+            "type": "jira",
+            "nickname": "jira",
+            "tickets": [ticket],
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    update_source(job_ref, source["source_key"], {
+        "stage": "embed",
+        "updated_at": now,
+    })
+
+    # ---- Embed + Pinecone ----
+    namespace = _get_team_pinecone_namespace(db, team_id)
+
+    text = _build_jira_ticket_text(ticket) or f"Jira Ticket ID {ticket_id}"
+    openai_client = get_openai_client()
+    emb = generate_embeddings([text], openai_client)[0]
+
+    raw_id = f"jira_{team_id}_{ticket_id}"
+    vector_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in raw_id)
+
+    vectors = [{
+        "id": vector_id,
+        "values": emb,
+        "metadata": {
+            "nickname": "jira",
+            "source": "jira",
+            "jira_id": ticket_id,
+            "text_preview": text[:500],
+        },
+    }]
+
+    upload_vectors_to_pinecone(vectors, namespace, index_name="production", batch_size=100)
+
+    # ---- done ----
+    update_source(job_ref, source["source_key"], {
+        "status": "done",
+        "stage": "done",
+        "checkpoint": {"embedded": True},
+        "updated_at": utcnow(),
+    })
+# ======================
 # JOB PROCESSOR
 # ======================
 
@@ -404,6 +514,10 @@ def process_job(db, job_ref):
             
         if source["type"] == "slack":
             process_slack_source(db, job_ref, job, source)
+            completed += 1
+        
+        if source["type"] == "jira":
+            process_jira_source(db, job_ref, job, source)
             completed += 1
 
         update_job(

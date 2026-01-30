@@ -1976,8 +1976,7 @@ def jira_get_workspaces():
 @require_solari_key
 def jira_add_ticket():
     """
-    Add Jira tickets as a source for both agent and team scopes.
-    
+    Enqueue Jira ingestion job (v1.5).
     Request Body:
     {
       "user_id": "firebase_uid",
@@ -1985,124 +1984,240 @@ def jira_add_ticket():
       "tickets": [ { ...ticket fields... } ]
     }
     """
-    try:
-        body = request.get_json(force=True) or {}
-        user_id = body.get("user_id")
-        agent_id = body.get("agent_id")
-        tickets = body.get("tickets")
-        
-        if not user_id:
-            return jsonify({"status": "failure", "error": "user_id is required"}), 400
-        if not agent_id:
-            return jsonify({"status": "failure", "error": "agent_id is required"}), 400
-        if not isinstance(tickets, list) or not tickets:
-            return jsonify({"status": "failure", "error": "tickets must be a non-empty list"}), 400
-        
-        for ticket in tickets:
-            if not isinstance(ticket, dict):
-                return jsonify({"status": "failure", "error": "each ticket must be an object"}), 400
-            if not ticket.get("id"):
-                return jsonify({"status": "failure", "error": "each ticket must include id"}), 400
-        
-        db = firestore.client()
-        team_id = get_team_id_for_uid(db, user_id)
-        namespace = _get_team_pinecone_namespace(db, team_id)
-        
-        # --- Agent-level Jira source ---
-        agent_sources_ref = (
-            db.collection("teams").document(team_id)
-              .collection("agents").document(agent_id)
-              .collection("sources")
-        )
-        agent_jira_docs = agent_sources_ref.where("type", "==", "jira").stream()
-        agent_jira_doc = next(agent_jira_docs, None)
-        
-        if agent_jira_doc:
-            existing_agent_tickets = (agent_jira_doc.to_dict() or {}).get("tickets", [])
-            merged_tickets = _merge_jira_tickets(existing_agent_tickets, tickets)
-            agent_sources_ref.document(agent_jira_doc.id).update({
-                "nickname": "jira",
-                "tickets": merged_tickets,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            })
-        else:
-            agent_sources_ref.add({
-                "type": "jira",
-                "nickname": "jira",
-                "agent_id": agent_id,
-                "tickets": tickets,
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            })
-        
-        # --- Team-level Jira source ---
-        team_sources_ref = db.collection("teams").document(team_id).collection("sources")
-        team_jira_docs = team_sources_ref.where("type", "==", "jira").stream()
-        team_jira_doc = next(team_jira_docs, None)
-        
-        if team_jira_doc:
-            existing_team_tickets = (team_jira_doc.to_dict() or {}).get("tickets", [])
-            merged_tickets = _merge_jira_tickets(existing_team_tickets, tickets)
-            team_sources_ref.document(team_jira_doc.id).update({
-                "nickname": "jira",
-                "tickets": merged_tickets,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            })
-        else:
-            team_sources_ref.add({
-                "type": "jira",
-                "nickname": "jira",
-                "tickets": tickets,
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            })
-        
-        ticket_texts = []
-        ticket_metadatas = []
-        vector_ids = []
-        for ticket in tickets:
-            ticket_id = str(ticket.get("id"))
-            text = _build_jira_ticket_text(ticket)
-            if not text:
-                text = f"Jira Ticket ID {ticket_id}"
-            ticket_texts.append(text)
-            ticket_metadatas.append({
-                "nickname": "jira",
-                "source": "jira",
-                "jira_id": ticket_id,
-                "text_preview": text,
-            })
-            raw_id = f"jira_{team_id}_{ticket_id}"
-            safe_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in raw_id)
-            vector_ids.append(safe_id)
+    body = request.get_json(force=True) or {}
+    user_id = body.get("user_id")
+    agent_id = body.get("agent_id")
+    tickets = body.get("tickets")
 
-        openai_client = get_openai_client()
-        embeddings = generate_embeddings(ticket_texts, openai_client)
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    if not agent_id:
+        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+    if not isinstance(tickets, list) or not tickets:
+        return jsonify({"status": "failure", "error": "tickets must be a non-empty list"}), 400
 
-        vectors = []
-        for embedding, metadata, vector_id in zip(embeddings, ticket_metadatas, vector_ids):
-            vectors.append({
-                "id": vector_id,
-                "values": embedding,
-                "metadata": metadata,
-            })
+    for t in tickets:
+        if not isinstance(t, dict):
+            return jsonify({"status": "failure", "error": "each ticket must be an object"}), 400
+        if not t.get("id"):
+            return jsonify({"status": "failure", "error": "each ticket must include id"}), 400
 
-        index_name = "production"
-        total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+    db = firestore.client()
+    team_id = get_team_id_for_uid(db, user_id)
 
-        return jsonify({
-            "status": "success",
-            "vectors_uploaded": total_uploaded,
-            "namespace": namespace,
-            "index": index_name,
-        }), 200
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30)
+
+    sources = []
+    for t in tickets:
+        ticket_id = str(t.get("id"))
+        fields = t.get("fields") or {}
+        project = fields.get("project") or {}
+        status = fields.get("status") or {}
+        issuetype = fields.get("issuetype") or {}
+        assignee = fields.get("assignee") or None
+
+        assignee_payload = None
+        if assignee:
+            assignee_payload = {
+                "displayName": assignee.get("displayName"),
+                "accountId": assignee.get("accountId"),
+            }
+
+        ticket_payload = {
+            "key": t.get("key"),
+            "id": t.get("id"),
+            "summary": fields.get("summary") or t.get("summary"),
+            "project": {
+                "key": project.get("key"),
+                "name": project.get("name"),
+            },
+            "status": status.get("name"),
+            "issuetype": issuetype.get("name"),
+            "assignee": assignee_payload,
+            "created": fields.get("created"),
+            "self": t.get("self"),
+        }
+        sources.append({
+            "source_key": f"jira:{ticket_id}",
+            "type": "jira",
+            "id": ticket_id,
+            "title": ticket_payload.get("key") or ticket_payload.get("summary") or f"Jira {ticket_id}",
+            "url": t.get("url"),
+            "ticket": ticket_payload,
+            "status": "queued",
+            "stage": "queued",
+            "checkpoint": {
+                "embedded": False,
+            },
+            "error": None,
+            "updated_at": now,  # IMPORTANT: datetime, not SERVER_TIMESTAMP
+        })
+
+    job_id = uuid.uuid4().hex
+    job_ref = (
+        db.collection("teams").document(team_id)
+          .collection("upload_jobs").document(job_id)
+    )
+
+    job_ref.set({
+        "job_type": "ingest_sources",
+        "connector": "jira",
+        "status": "queued",
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": expires_at,
+
+        "locked_by": None,
+        "locked_until": None,
+        "progress": 0,
+        "message": "Queued",
+        "created_by_user_id": user_id,
+
+        "team_id": team_id,
+        "agent_id": agent_id,
+
+        "sources": sources,
+    })
+
+    return jsonify({
+        "status": "success",
+        "job_id": job_id,
+        "team_id": team_id,
+        "queued_sources": len(sources),
+    }), 200
+
+# @app.route("/api/jira/add_ticket", methods=["POST"])
+# @require_solari_key
+# def jira_add_ticket():
+#     """
+#     Add Jira tickets as a source for both agent and team scopes.
     
-    except KeyError as e:
-        logger.error(f"Jira add ticket error: {str(e)}")
-        return jsonify({"status": "failure", "error": str(e)}), 400
-    except Exception as e:
-        logger.error(f"Jira add ticket error: {str(e)}", exc_info=True)
-        return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
+#     Request Body:
+#     {
+#       "user_id": "firebase_uid",
+#       "agent_id": "agent_id",
+#       "tickets": [ { ...ticket fields... } ]
+#     }
+#     """
+#     try:
+#         body = request.get_json(force=True) or {}
+#         user_id = body.get("user_id")
+#         agent_id = body.get("agent_id")
+#         tickets = body.get("tickets")
+        
+#         if not user_id:
+#             return jsonify({"status": "failure", "error": "user_id is required"}), 400
+#         if not agent_id:
+#             return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+#         if not isinstance(tickets, list) or not tickets:
+#             return jsonify({"status": "failure", "error": "tickets must be a non-empty list"}), 400
+        
+#         for ticket in tickets:
+#             if not isinstance(ticket, dict):
+#                 return jsonify({"status": "failure", "error": "each ticket must be an object"}), 400
+#             if not ticket.get("id"):
+#                 return jsonify({"status": "failure", "error": "each ticket must include id"}), 400
+        
+#         db = firestore.client()
+#         team_id = get_team_id_for_uid(db, user_id)
+#         namespace = _get_team_pinecone_namespace(db, team_id)
+        
+#         # --- Agent-level Jira source ---
+#         agent_sources_ref = (
+#             db.collection("teams").document(team_id)
+#               .collection("agents").document(agent_id)
+#               .collection("sources")
+#         )
+#         agent_jira_docs = agent_sources_ref.where("type", "==", "jira").stream()
+#         agent_jira_doc = next(agent_jira_docs, None)
+        
+#         if agent_jira_doc:
+#             existing_agent_tickets = (agent_jira_doc.to_dict() or {}).get("tickets", [])
+#             merged_tickets = _merge_jira_tickets(existing_agent_tickets, tickets)
+#             agent_sources_ref.document(agent_jira_doc.id).update({
+#                 "nickname": "jira",
+#                 "tickets": merged_tickets,
+#                 "updated_at": firestore.SERVER_TIMESTAMP
+#             })
+#         else:
+#             agent_sources_ref.add({
+#                 "type": "jira",
+#                 "nickname": "jira",
+#                 "agent_id": agent_id,
+#                 "tickets": tickets,
+#                 "created_at": firestore.SERVER_TIMESTAMP,
+#                 "updated_at": firestore.SERVER_TIMESTAMP
+#             })
+        
+#         # --- Team-level Jira source ---
+#         team_sources_ref = db.collection("teams").document(team_id).collection("sources")
+#         team_jira_docs = team_sources_ref.where("type", "==", "jira").stream()
+#         team_jira_doc = next(team_jira_docs, None)
+        
+#         if team_jira_doc:
+#             existing_team_tickets = (team_jira_doc.to_dict() or {}).get("tickets", [])
+#             merged_tickets = _merge_jira_tickets(existing_team_tickets, tickets)
+#             team_sources_ref.document(team_jira_doc.id).update({
+#                 "nickname": "jira",
+#                 "tickets": merged_tickets,
+#                 "updated_at": firestore.SERVER_TIMESTAMP
+#             })
+#         else:
+#             team_sources_ref.add({
+#                 "type": "jira",
+#                 "nickname": "jira",
+#                 "tickets": tickets,
+#                 "created_at": firestore.SERVER_TIMESTAMP,
+#                 "updated_at": firestore.SERVER_TIMESTAMP
+#             })
+        
+#         ticket_texts = []
+#         ticket_metadatas = []
+#         vector_ids = []
+#         for ticket in tickets:
+#             ticket_id = str(ticket.get("id"))
+#             text = _build_jira_ticket_text(ticket)
+#             if not text:
+#                 text = f"Jira Ticket ID {ticket_id}"
+#             ticket_texts.append(text)
+#             ticket_metadatas.append({
+#                 "nickname": "jira",
+#                 "source": "jira",
+#                 "jira_id": ticket_id,
+#                 "text_preview": text,
+#             })
+#             raw_id = f"jira_{team_id}_{ticket_id}"
+#             safe_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in raw_id)
+#             vector_ids.append(safe_id)
+
+#         openai_client = get_openai_client()
+#         embeddings = generate_embeddings(ticket_texts, openai_client)
+
+#         vectors = []
+#         for embedding, metadata, vector_id in zip(embeddings, ticket_metadatas, vector_ids):
+#             vectors.append({
+#                 "id": vector_id,
+#                 "values": embedding,
+#                 "metadata": metadata,
+#             })
+
+#         index_name = "production"
+#         total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+
+#         return jsonify({
+#             "status": "success",
+#             "vectors_uploaded": total_uploaded,
+#             "namespace": namespace,
+#             "index": index_name,
+#         }), 200
+    
+#     except KeyError as e:
+#         logger.error(f"Jira add ticket error: {str(e)}")
+#         return jsonify({"status": "failure", "error": str(e)}), 400
+#     except Exception as e:
+#         logger.error(f"Jira add ticket error: {str(e)}", exc_info=True)
+#         return jsonify({"status": "failure", "error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/api/jira/delete_ticket", methods=["POST"])
 @require_solari_key
