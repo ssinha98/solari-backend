@@ -402,7 +402,8 @@ def get_pinecone_grpc_index():
 # Initialize OpenAI client
 def get_openai_client():
     """Initialize and return OpenAI client"""
-    api_key = get_api_key('OPENAI_API_KEY')
+    # api_key = get_api_key('OPENAI_API_KEY')
+    api_key = get_api_key('KEYWORDS_API_KEY_PROD')
     return OpenAI(base_url="https://api.keywordsai.co/api/", api_key=api_key)
 
 def get_keywordsai_client() -> OpenAI:
