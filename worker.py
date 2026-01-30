@@ -86,7 +86,7 @@ def process_slack_source(db, job_ref, job, source):
         "status": "processing",
         "stage": "sync_and_embed",
         "error": None,
-        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": utcnow(),
     })
 
     namespace = _get_team_pinecone_namespace(db, team_id)
@@ -111,7 +111,7 @@ def process_slack_source(db, job_ref, job, source):
             "status": "error",
             "stage": "error",
             "error": result.get("error") or "slack_ingest_failed",
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": utcnow(),
         })
         return
 
@@ -119,7 +119,7 @@ def process_slack_source(db, job_ref, job, source):
         "status": "done",
         "stage": "done",
         "error": None,
-        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": utcnow(),
     })
 
 # ======================
@@ -221,11 +221,11 @@ def claim_next_job(db):
 def renew_lease(job_ref):
     job_ref.update({
         "locked_until": utcnow() + timedelta(seconds=LEASE_SECONDS),
-        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": utcnow(),
     })
 
 def update_job(job_ref, **fields):
-    fields["updated_at"] = firestore.SERVER_TIMESTAMP
+    fields["updated_at"] = utcnow()
     job_ref.update(fields)
 
 def update_source(job_ref, source_key, patch):
@@ -240,7 +240,7 @@ def update_source(job_ref, source_key, patch):
 
     job_ref.update({
         "sources": sources,
-        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": utcnow(),
     })
 
 # ======================
@@ -290,7 +290,7 @@ def process_confluence_source(db, job_ref, job, source):
             "bodyPreview": excerpt,
             "nickname": nickname,
             "agents": firestore.ArrayUnion([agent_id]),
-            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": utcnow(),
         })
     else:
         ref = team_sources_ref.document()
@@ -304,8 +304,8 @@ def process_confluence_source(db, job_ref, job, source):
             "bodyPreview": excerpt,
             "nickname": nickname,
             "agents": [agent_id],
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "createdAt": utcnow(),
+            "updatedAt": utcnow(),
         })
 
     # ---- AGENT SOURCE UPSERT ----
@@ -320,14 +320,14 @@ def process_confluence_source(db, job_ref, job, source):
         "type": "confluence_page",
         "bodyPreview": excerpt,
         "nickname": nickname,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": utcnow(),
     }
 
     if agent_doc:
         agent_sources_ref.document(agent_doc.id).update(payload)
         agent_doc_id = agent_doc.id
     else:
-        payload["createdAt"] = firestore.SERVER_TIMESTAMP
+        payload["createdAt"] = utcnow()
         agent_sources_ref.add(payload)
         agent_doc_id = None
 
