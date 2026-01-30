@@ -41,7 +41,8 @@ from app import (
     _merge_jira_tickets,
     download_file_from_firebase,
     extract_text_from_file,
-    scrape_website_with_firecrawl
+    scrape_website_with_firecrawl, 
+    analyze_tabular_data
     )
 
 # ======================
@@ -699,6 +700,96 @@ def process_website_source(db, job_ref, job, source):
         })
 
     update_source(job_ref, source_key, {"status": "done", "stage": "done"})
+
+
+
+# ======================
+# table stuff
+# ======================
+def process_table_source(db, job_ref, job, source):
+    """
+    source.id is the agent source document_id:
+      teams/{team_id}/agents/{agent_id}/sources/{document_id}
+
+    We read filePath from that doc, download from Storage, analyze,
+    then write metadata back to the source doc.
+    """
+    team_id = job["team_id"]
+    agent_id = job["agent_id"]
+    document_id = source["id"]
+    source_key = source["source_key"]
+
+    now = utcnow()
+    update_source(job_ref, source_key, {
+        "status": "processing",
+        "stage": "load_doc",
+        "updated_at": now,
+        "error": None,
+    })
+
+    # 1) Load the source doc
+    doc_ref = (
+        db.collection("teams").document(team_id)
+          .collection("agents").document(agent_id)
+          .collection("sources").document(document_id)
+    )
+    snap = doc_ref.get()
+    if not snap.exists:
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "error",
+            "updated_at": utcnow(),
+            "error": f"source_doc_not_found:{document_id}",
+        })
+        return
+
+    doc_data = snap.to_dict() or {}
+    file_path = doc_data.get("filePath")
+    if not file_path:
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "error",
+            "updated_at": utcnow(),
+            "error": "filePath_missing_in_source_doc",
+        })
+        return
+
+    # (Optional) reflect file path in job source entry for UI
+    update_source(job_ref, source_key, {
+        "stage": "download",
+        "filePath": file_path,
+        "updated_at": utcnow(),
+    })
+
+    # 2) Download file
+    file_content = download_file_from_firebase(file_path)
+
+    # 3) Analyze
+    update_source(job_ref, source_key, {"stage": "analyze", "updated_at": utcnow()})
+    analysis = analyze_tabular_data(file_content, file_path)
+
+    row_count = int(analysis.get("row_count") or 0)
+    columns = analysis.get("columns") or []
+    column_count = len(columns)
+
+    # 4) Update source doc with metadata so agent can use it immediately
+    update_source(job_ref, source_key, {"stage": "write_metadata", "updated_at": utcnow()})
+
+    doc_ref.update({
+        "row_count": row_count,
+        "column_count": column_count,
+        "columns": columns,              # keep if you want; or store separately if huge
+        "analyzed_at": utcnow(),
+        "analysis_status": "done",
+    })
+
+    # 5) Mark job source done
+    update_source(job_ref, source_key, {
+        "status": "done",
+        "stage": "done",
+        "updated_at": utcnow(),
+        "error": None,
+    })
 # ======================
 # JOB PROCESSOR
 # ======================
