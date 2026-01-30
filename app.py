@@ -3182,7 +3182,7 @@ def website_add_urls():
                 "total_chunks": None,
             },
             "error": None,
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": now,
         })
 
     now = datetime.now(timezone.utc)
