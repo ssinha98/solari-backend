@@ -488,6 +488,105 @@ def process_jira_source(db, job_ref, job, source):
         "checkpoint": {"embedded": True},
         "updated_at": utcnow(),
     })
+
+
+
+# ======================
+# DOC STUFF
+# ======================
+def process_doc_source(db, job_ref, job, source):
+    team_id = job["team_id"]
+    agent_id = job["agent_id"]
+    user_id = job["created_by_user_id"]
+
+    file_path = source.get("file_path") or source.get("id")
+    nickname = source.get("nickname") or ""
+
+    if not file_path:
+        raise RuntimeError("doc_missing_file_path")
+
+    source_key = source["source_key"]
+    now = utcnow()
+
+    update_source(job_ref, source_key, {
+        "status": "processing",
+        "stage": "download",
+        "error": None,
+        "updated_at": now,
+    })
+
+    namespace = _get_team_pinecone_namespace(db, team_id)
+    openai_client = get_openai_client()
+
+    # 1) download file bytes
+    file_content = download_file_from_firebase(file_path)
+
+    # 2) extract text
+    update_source(job_ref, source_key, {"stage": "extract", "updated_at": utcnow()})
+    text = extract_text_from_file(file_content, file_path) or ""
+
+    if not text.strip():
+        update_source(job_ref, source_key, {
+            "status": "done",
+            "stage": "done",
+            "checkpoint": {"chunk_index": 0, "total_chunks": 0},
+            "updated_at": utcnow(),
+        })
+        return
+
+    # 3) chunk
+    update_source(job_ref, source_key, {"stage": "chunk", "updated_at": utcnow()})
+    chunks = chunk_text(text, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFAULT_CHUNK_OVERLAP)
+
+    checkpoint = source.get("checkpoint") or {}
+    start_i = int(checkpoint.get("chunk_index") or 0)
+
+    update_source(job_ref, source_key, {
+        "stage": "embed",
+        "checkpoint": {
+            "chunk_index": start_i,
+            "total_chunks": len(chunks),
+        },
+        "updated_at": utcnow(),
+    })
+
+    # 4) embed + upload vectors (batch upload like your current endpoint)
+    #    To keep this simple & fast, we embed/upload from start_i onward in one go.
+    chunk_slice = chunks[start_i:]
+    embeddings = generate_embeddings(chunk_slice, openai_client)
+
+    vectors = []
+    for local_idx, (chunk_text_str, emb) in enumerate(zip(chunk_slice, embeddings)):
+        i = start_i + local_idx
+        raw_id = f"doc_{team_id}_{file_path}_chunk_{i}"
+        vector_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in raw_id)
+
+        vectors.append({
+            "id": vector_id,
+            "values": emb,
+            "metadata": {
+                "source": "doc",
+                "team_id": team_id,
+                "agent_id": agent_id,
+                "file_path": file_path,
+                "chunk_index": i,
+                "nickname": nickname,
+                "text_preview": (chunk_text_str or "")[:500],
+            }
+        })
+
+    upload_vectors_to_pinecone(vectors, namespace, index_name="production", batch_size=100)
+
+    # 5) done
+    update_source(job_ref, source_key, {
+        "status": "done",
+        "stage": "done",
+        "checkpoint": {
+            "chunk_index": len(chunks),
+            "total_chunks": len(chunks),
+        },
+        "updated_at": utcnow(),
+    })
 # ======================
 # JOB PROCESSOR
 # ======================
@@ -511,7 +610,11 @@ def process_job(db, job_ref):
         if source["type"] == "confluence":
             process_confluence_source(db, job_ref, job, source)
             completed += 1
-            
+        
+        if source["type"] == "doc":
+            process_doc_source(db, job_ref, job, source)
+            completed += 1
+        
         if source["type"] == "slack":
             process_slack_source(db, job_ref, job, source)
             completed += 1

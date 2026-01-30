@@ -2854,132 +2854,216 @@ def delete_agent():
         logger.error(f"Error in delete_agent: {str(e)}", exc_info=True)
         return jsonify({"status": "failure", "reason": str(e)}), 500
 
-@app.route('/api/pinecone_doc_upload', methods=['POST'])
+# @app.route('/api/pinecone_doc_upload', methods=['POST'])
+# @require_solari_key
+# def pinecone_doc_upload():
+#     """
+#     Upload documents to Pinecone after processing.
+    
+#     Expected request body:
+#     {
+#         "namespace": "your-namespace",
+#         "file_path": "users/userId/files/file.pdf",
+#         "nickname": "optional-nickname"  # optional
+#     }
+    
+#     Process:
+#     1. Download file from Firebase Storage
+#     2. Extract text from file (PDF/DOCX)
+#     3. Chunk the text
+#     4. Generate embeddings using OpenAI
+#     5. Upload to Pinecone
+    
+#     Returns:
+#         JSON response with upload status
+#     """
+#     try:
+#         # Get request data
+#         data = request.get_json()
+        
+#         if not data:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'Request body is required'
+#             }), 400
+        
+#         # Validate required fields
+#         namespace = data.get('namespace')
+#         if not namespace:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'namespace parameter is required'
+#             }), 400
+        
+#         file_path = data.get('file_path')
+#         if not file_path:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'file_path parameter is required'
+#             }), 400
+        
+#         # Optional parameter
+#         nickname = data.get('nickname', '')
+        
+#         logger.info(f"Processing file: {file_path} for namespace: {namespace}")
+        
+#         # Step 1: Download file from Firebase Storage
+#         logger.info("Downloading file from Firebase Storage...")
+#         file_content = download_file_from_firebase(file_path)
+        
+#         # Step 2: Extract text from file
+#         logger.info("Extracting text from file...")
+#         text = extract_text_from_file(file_content, file_path)
+        
+#         if not text or len(text.strip()) == 0:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'No text could be extracted from the file'
+#             }), 400
+        
+#         logger.info(f"Extracted {len(text)} characters of text")
+        
+#         # Step 3: Chunk the text
+#         logger.info("Chunking text...")
+#         text_chunks = chunk_text(text, chunk_size=1000, chunk_overlap=200)
+#         logger.info(f"Created {len(text_chunks)} chunks")
+        
+#         # Step 4: Generate embeddings
+#         logger.info("Generating embeddings...")
+#         openai_client = get_openai_client()
+#         embeddings = generate_embeddings(text_chunks, openai_client)
+        
+#         # Step 5: Prepare vectors for Pinecone
+#         # Use file_path as base for IDs (sanitize it)
+#         file_id_base = file_path.replace('/', '_').replace(' ', '_')
+#         vectors = []
+#         for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
+#             vectors.append({
+#                 'id': f"{file_id_base}_chunk_{i}",
+#                 'values': embedding,
+#                 'metadata': {
+#                     'file_path': file_path,
+#                     'chunk_index': i,
+#                     'text_preview': chunk[:500],  # Store first 500 chars as metadata
+#                     'nickname': nickname  # Add nickname to metadata
+#                 }
+#             })
+        
+#         # Step 6: Upload to Pinecone in batches
+#         logger.info(f"Uploading {len(vectors)} vectors to Pinecone in batches...")
+#         index_name = 'production'
+#         total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+        
+#         logger.info(f"Successfully uploaded {total_uploaded} vectors to namespace '{namespace}'")
+        
+#         return jsonify({
+#             'status': 'success',
+#             'message': f'Successfully processed and uploaded {len(vectors)} vectors to namespace "{namespace}"',
+#             'namespace': namespace,
+#             'index': index_name,
+#             'file_path': file_path,
+#             'vectors_uploaded': len(vectors),
+#             'chunks_created': len(text_chunks),
+#             'text_length': len(text),
+#             'nickname': nickname
+#         }), 200
+        
+#     except ValueError as e:
+#         logger.error(f"Validation error: {str(e)}")
+#         return jsonify({
+#             'status': 'error',
+#             'message': str(e)
+#         }), 400
+#     except Exception as e:
+#         logger.error(f"Error processing file: {str(e)}", exc_info=True)
+#         return jsonify({
+#             'status': 'error',
+#             'message': f'Failed to process file: {str(e)}'
+#         }), 500
+
+@app.route("/api/pinecone_doc_upload", methods=["POST"])
 @require_solari_key
 def pinecone_doc_upload():
     """
-    Upload documents to Pinecone after processing.
-    
-    Expected request body:
+    Enqueue doc ingestion job.
+
+    Request Body:
     {
-        "namespace": "your-namespace",
-        "file_path": "users/userId/files/file.pdf",
-        "nickname": "optional-nickname"  # optional
+      "user_id": "...",
+      "agent_id": "...",
+      "file_path": "teams/{teamId}/sources/{sourceId}/.../file.pdf" OR "users/{uid}/.../file.pdf",
+      "nickname": "optional"
     }
-    
-    Process:
-    1. Download file from Firebase Storage
-    2. Extract text from file (PDF/DOCX)
-    3. Chunk the text
-    4. Generate embeddings using OpenAI
-    5. Upload to Pinecone
-    
-    Returns:
-        JSON response with upload status
     """
-    try:
-        # Get request data
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Request body is required'
-            }), 400
-        
-        # Validate required fields
-        namespace = data.get('namespace')
-        if not namespace:
-            return jsonify({
-                'status': 'error',
-                'message': 'namespace parameter is required'
-            }), 400
-        
-        file_path = data.get('file_path')
-        if not file_path:
-            return jsonify({
-                'status': 'error',
-                'message': 'file_path parameter is required'
-            }), 400
-        
-        # Optional parameter
-        nickname = data.get('nickname', '')
-        
-        logger.info(f"Processing file: {file_path} for namespace: {namespace}")
-        
-        # Step 1: Download file from Firebase Storage
-        logger.info("Downloading file from Firebase Storage...")
-        file_content = download_file_from_firebase(file_path)
-        
-        # Step 2: Extract text from file
-        logger.info("Extracting text from file...")
-        text = extract_text_from_file(file_content, file_path)
-        
-        if not text or len(text.strip()) == 0:
-            return jsonify({
-                'status': 'error',
-                'message': 'No text could be extracted from the file'
-            }), 400
-        
-        logger.info(f"Extracted {len(text)} characters of text")
-        
-        # Step 3: Chunk the text
-        logger.info("Chunking text...")
-        text_chunks = chunk_text(text, chunk_size=1000, chunk_overlap=200)
-        logger.info(f"Created {len(text_chunks)} chunks")
-        
-        # Step 4: Generate embeddings
-        logger.info("Generating embeddings...")
-        openai_client = get_openai_client()
-        embeddings = generate_embeddings(text_chunks, openai_client)
-        
-        # Step 5: Prepare vectors for Pinecone
-        # Use file_path as base for IDs (sanitize it)
-        file_id_base = file_path.replace('/', '_').replace(' ', '_')
-        vectors = []
-        for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
-            vectors.append({
-                'id': f"{file_id_base}_chunk_{i}",
-                'values': embedding,
-                'metadata': {
-                    'file_path': file_path,
-                    'chunk_index': i,
-                    'text_preview': chunk[:500],  # Store first 500 chars as metadata
-                    'nickname': nickname  # Add nickname to metadata
-                }
-            })
-        
-        # Step 6: Upload to Pinecone in batches
-        logger.info(f"Uploading {len(vectors)} vectors to Pinecone in batches...")
-        index_name = 'production'
-        total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
-        
-        logger.info(f"Successfully uploaded {total_uploaded} vectors to namespace '{namespace}'")
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'Successfully processed and uploaded {len(vectors)} vectors to namespace "{namespace}"',
-            'namespace': namespace,
-            'index': index_name,
-            'file_path': file_path,
-            'vectors_uploaded': len(vectors),
-            'chunks_created': len(text_chunks),
-            'text_length': len(text),
-            'nickname': nickname
-        }), 200
-        
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 400
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Failed to process file: {str(e)}'
-        }), 500
+    body = request.get_json(force=True) or {}
+    user_id = body.get("user_id") or body.get("uid")
+    agent_id = body.get("agent_id") or body.get("agentId")
+    file_path = body.get("file_path") or body.get("filePath")
+    nickname = (body.get("nickname") or "").strip()
+
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    if not agent_id:
+        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+    if not file_path:
+        return jsonify({"status": "failure", "error": "file_path is required"}), 400
+
+    db = firestore.client()
+    team_id = get_team_id_for_uid(db, user_id)
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30)
+
+    job_id = uuid.uuid4().hex
+    job_ref = (
+        db.collection("teams").document(team_id)
+          .collection("upload_jobs").document(job_id)
+    )
+
+    # single “source” for this upload
+    source_key = f"doc:{file_path}"
+
+    job_ref.set({
+        "job_type": "ingest_sources",
+        "connector": "doc",
+        "status": "queued",
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": expires_at,
+
+        "locked_by": None,
+        "locked_until": None,
+        "progress": 0,
+        "message": "Queued",
+        "created_by_user_id": user_id,
+
+        "team_id": team_id,
+        "agent_id": agent_id,
+
+        "sources": [{
+            "source_key": source_key,
+            "type": "doc",
+            "id": file_path,          # keep it simple: id == file_path
+            "file_path": file_path,
+            "nickname": nickname or None,
+
+            "status": "queued",
+            "stage": "queued",
+            "checkpoint": {
+                "chunk_index": 0,
+                "total_chunks": None,
+            },
+            "error": None,
+            "updated_at": now,         # datetime, not SERVER_TIMESTAMP
+        }],
+    })
+
+    return jsonify({
+        "status": "success",
+        "job_id": job_id,
+        "team_id": team_id,
+        "queued_sources": 1,
+    }), 200
 
 # Add this function after the generate_embeddings function (around line 354)
 
