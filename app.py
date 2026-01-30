@@ -210,6 +210,64 @@ def send_email(to_email, subject, body, html_body=None):
         logger.error(f"Error sending email: {str(e)}")
         return None
 
+def update_job(
+    job_ref,
+    *,
+    status=None,
+    progress=None,
+    message=None,
+    locked_by=None,
+    locked_until=None,
+):
+    updates = {}
+
+    if status is not None:
+        updates["status"] = status
+
+    if progress is not None:
+        updates["progress"] = progress
+
+    if message is not None:
+        updates["message"] = message
+
+    if locked_by is not None:
+        updates["locked_by"] = locked_by
+
+    if locked_until is not None:
+        updates["locked_until"] = locked_until
+
+    if not updates:
+        return
+
+    updates["updated_at_unix"] = int(time.time())
+
+    job_ref.update(updates)
+
+def update_source(job_ref, source_key, patch):
+    snap = job_ref.get()
+    if not snap.exists:
+        return
+
+    job = snap.to_dict() or {}
+    sources = job.get("sources", [])
+
+    updated = False
+    for i, src in enumerate(sources):
+        if src.get("source_key") == source_key:
+            new_src = dict(src)
+            new_src.update(patch)
+            sources[i] = new_src
+            updated = True
+            break
+
+    if not updated:
+        return
+
+    job_ref.update({
+        "sources": sources,
+        "updated_at_unix": int(time.time()),
+    })
+
 # Global Response Handler
 @app.after_request
 def after_request(response):
@@ -4102,89 +4160,8 @@ def run_fixed_duckdb_query(local_csv_path: str, limit: int = 25) -> pd.DataFrame
         logger.error(f"Error running DuckDB query: {str(e)}")
         raise ValueError(f"Failed to run DuckDB query: {str(e)}")
 
-@app.post("/api/table/analyze_async")
-@require_solari_key
-def table_analyze_async():
-    """
-    Enqueue a table analysis job. Client uploads file to Storage first, writes the source doc,
-    then calls this with the source document_id to analyze.
-
-    Body:
-    {
-      "user_id": "...",
-      "agent_id": "...",
-      "document_id": "..."  # this is the source doc id under teams/{team}/agents/{agent}/sources/{document_id}
-    }
-    """
-    body = request.get_json(force=True) or {}
-
-    user_id = body.get("user_id")
-    agent_id = body.get("agent_id") or body.get("agentId")
-    document_id = body.get("document_id") or body.get("documentId")
-
-    if not user_id:
-        return jsonify({"status": "failure", "error": "user_id is required"}), 400
-    if not agent_id:
-        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
-    if not document_id:
-        return jsonify({"status": "failure", "error": "document_id is required"}), 400
-
-    db = firestore.client()
-    team_id = get_team_id_for_uid(db, user_id)
-
-    now = utcnow()
-    expires_at = now + timedelta(days=DEFAULT_TTL_DAYS)
-
-    job_id = uuid.uuid4().hex
-    job_ref = (
-        db.collection("teams").document(team_id)
-          .collection("upload_jobs").document(job_id)
-    )
-
-    # Minimal source entry for the worker
-    source_key = f"table:{document_id}"
-    sources = [{
-        "source_key": source_key,
-        "type": "table",
-        "id": document_id,          # the agent source doc id
-        "title": document_id,       # optional; UI can replace with nickname/name from the source doc
-        "status": "queued",
-        "stage": "queued",
-        "checkpoint": {},
-        "error": None,
-        "updated_at": now,
-    }]
-
-    job_ref.set({
-        "job_type": "ingest_sources",
-        "connector": "table",
-        "status": "queued",
-        "created_at": now,
-        "updated_at": now,
-        "expires_at": expires_at,
-
-        "locked_by": None,
-        "locked_until": None,
-        "progress": 0,
-        "message": "Queued",
-        "created_by_user_id": user_id,
-
-        "team_id": team_id,
-        "agent_id": agent_id,
-
-        "sources": sources,
-    })
-
-    return jsonify({
-        "status": "success",
-        "job_id": job_id,
-        "team_id": team_id,
-        "queued_sources": 1,
-    }), 200
-
 DEFAULT_TTL_DAYS = 30
 
-
 @app.post("/api/table/analyze_async")
 @require_solari_key
 def table_analyze_async():
@@ -4264,156 +4241,30 @@ def table_analyze_async():
         "team_id": team_id,
         "queued_sources": 1,
     }), 200
-# @app.route('/api/table/analyze', methods=['POST'])
-# @require_solari_key
-# def analyze_table():
-#     """
-#     Analyze a tabular data file from a Firestore document.
-    
-#     Expected request body:
-#     {
-#         "team_id": "team123",
-#         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
-#         "agent_id": "agent123",
-#         "document_id": "miRtr9IDqCzu66rBksTG"
-#     }
-    
-#     Process:
-#     1. Get document from Firestore at teams/{team_id}/agents/{agent_id}/sources/{document_id}
-#     2. Extract filePath from document
-#     3. Download file from Firebase Storage
-#     4. Analyze file to get row count and column types
-#     5. Return results
-    
-#     Returns:
-#         JSON response with row count and column information
-#     """
-#     try:
-#         # Get request data
-#         data = request.get_json()
-        
-#         if not data:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': 'Request body is required'
-#             }), 400
-        
-#         # Validate required fields
-#         team_id = data.get('team_id') or data.get('teamId')
-#         if not team_id:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': 'team_id parameter is required'
-#             }), 400
 
-#         user_id = data.get('user_id')
-#         if not user_id:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': 'user_id parameter is required'
-#             }), 400
-        
-#         agent_id = data.get('agent_id')
-#         if not agent_id:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': 'agent_id parameter is required'
-#             }), 400
-        
-#         document_id = data.get('document_id')
-#         if not document_id:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': 'document_id parameter is required'
-#             }), 400
-        
-#         logger.info(f"Analyzing table for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
-        
-#         # Step 1: Get document from Firestore
-#         db = firestore.client()
-#         doc_ref = (
-#             db.collection('teams').document(team_id)
-#               .collection('agents').document(agent_id)
-#               .collection('sources').document(document_id)
-#         )
-#         doc = doc_ref.get()
-        
-#         if not doc.exists:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': f'Document not found: {document_id}'
-#             }), 404
-        
-#         doc_data = doc.to_dict()
-        
-#         # Step 2: Extract filePath
-#         file_path = doc_data.get('filePath')
-#         if not file_path:
-#             return jsonify({
-#                 'status': 'error',
-#                 'message': 'filePath not found in document'
-#             }), 400
-        
-#         logger.info(f"Found filePath: {file_path}")
-        
-#         # Step 3: Download file from Firebase Storage
-#         logger.info("Downloading file from Firebase Storage...")
-#         file_content = download_file_from_firebase(file_path)
-        
-#         # Step 4: Analyze tabular data
-#         logger.info("Analyzing tabular data...")
-#         analysis_result = analyze_tabular_data(file_content, file_path)
-        
-#         logger.info(f"Analysis complete: {analysis_result['row_count']} rows, {len(analysis_result['columns'])} columns")
-        
-#         # Step 5: Update Firestore document with metadata
-#         logger.info("Updating Firestore document with metadata...")
-#         doc_ref.update({
-#             'row_count': analysis_result['row_count'],
-#             'column_count': len(analysis_result['columns'])
-#         })
-#         logger.info("Successfully updated document with row_count and column_count")
-        
-#         return jsonify({
-#             'status': 'success',
-#             'message': 'Successfully analyzed tabular data',
-#             'document_id': document_id,
-#             'file_path': file_path,
-#             'row_count': analysis_result['row_count'],
-#             'columns': analysis_result['columns'],
-#             'column_count': len(analysis_result['columns'])
-#         }), 200
-        
-#     except ValueError as e:
-#         logger.error(f"Validation error: {str(e)}")
-#         return jsonify({
-#             'status': 'error',
-#             'message': str(e)
-#         }), 400
-#     except Exception as e:
-#         logger.error(f"Error analyzing table: {str(e)}", exc_info=True)
-#         return jsonify({
-#             'status': 'error',
-#             'message': f'Failed to analyze table: {str(e)}'
-#         }), 500
-
-@app.route('/api/table/download', methods=['POST'])
+@app.route('/api/table/analyze', methods=['POST'])
 @require_solari_key
-def download_table():
+def analyze_table():
     """
-    Test endpoint to download a table file from Firebase Storage using a Firestore source document.
+    Analyze a tabular data file from a Firestore document.
     
     Expected request body:
     {
         "team_id": "team123",
         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
         "agent_id": "agent123",
-        "document_id": "MV9pGL1YP6iLdCeBxKay"
+        "document_id": "miRtr9IDqCzu66rBksTG"
     }
     
+    Process:
+    1. Get document from Firestore at teams/{team_id}/agents/{agent_id}/sources/{document_id}
+    2. Extract filePath from document
+    3. Download file from Firebase Storage
+    4. Analyze file to get row count and column types
+    5. Return results
+    
     Returns:
-        JSON response with file metadata (row count, columns, types) and file size.
-        Note: file_content is bytes and not included in JSON response, but file_size is provided.
+        JSON response with row count and column information
     """
     try:
         # Get request data
@@ -4454,26 +4305,62 @@ def download_table():
                 'message': 'document_id parameter is required'
             }), 400
         
-        logger.info(f"Testing download_table_from_source for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
+        logger.info(f"Analyzing table for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
         
-        # Call the function
-        result = download_table_from_source(team_id, user_id, agent_id, document_id)
+        # Step 1: Get document from Firestore
+        db = firestore.client()
+        doc_ref = (
+            db.collection('teams').document(team_id)
+              .collection('agents').document(agent_id)
+              .collection('sources').document(document_id)
+        )
+        doc = doc_ref.get()
         
-        # Prepare response (exclude file_content bytes, but include file size)
-        response_data = {
+        if not doc.exists:
+            return jsonify({
+                'status': 'error',
+                'message': f'Document not found: {document_id}'
+            }), 404
+        
+        doc_data = doc.to_dict()
+        
+        # Step 2: Extract filePath
+        file_path = doc_data.get('filePath')
+        if not file_path:
+            return jsonify({
+                'status': 'error',
+                'message': 'filePath not found in document'
+            }), 400
+        
+        logger.info(f"Found filePath: {file_path}")
+        
+        # Step 3: Download file from Firebase Storage
+        logger.info("Downloading file from Firebase Storage...")
+        file_content = download_file_from_firebase(file_path)
+        
+        # Step 4: Analyze tabular data
+        logger.info("Analyzing tabular data...")
+        analysis_result = analyze_tabular_data(file_content, file_path)
+        
+        logger.info(f"Analysis complete: {analysis_result['row_count']} rows, {len(analysis_result['columns'])} columns")
+        
+        # Step 5: Update Firestore document with metadata
+        logger.info("Updating Firestore document with metadata...")
+        doc_ref.update({
+            'row_count': analysis_result['row_count'],
+            'column_count': len(analysis_result['columns'])
+        })
+        logger.info("Successfully updated document with row_count and column_count")
+        
+        return jsonify({
             'status': 'success',
-            'message': 'Successfully downloaded and analyzed table',
+            'message': 'Successfully analyzed tabular data',
             'document_id': document_id,
-            'file_path': result['file_path'],
-            'file_size_bytes': len(result['file_content']),
-            'row_count': result['row_count'],
-            'columns': result['columns'],
-            'column_count': result['column_count']
-        }
-        
-        logger.info(f"Test successful: {result['row_count']} rows, {result['column_count']} columns, {len(result['file_content'])} bytes")
-        
-        return jsonify(response_data), 200
+            'file_path': file_path,
+            'row_count': analysis_result['row_count'],
+            'columns': analysis_result['columns'],
+            'column_count': len(analysis_result['columns'])
+        }), 200
         
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
@@ -4482,10 +4369,255 @@ def download_table():
             'message': str(e)
         }), 400
     except Exception as e:
-        logger.error(f"Error downloading table: {str(e)}", exc_info=True)
+        logger.error(f"Error analyzing table: {str(e)}", exc_info=True)
         return jsonify({
             'status': 'error',
-            'message': f'Failed to download table: {str(e)}'
+            'message': f'Failed to analyze table: {str(e)}'
+        }), 500
+
+# @app.route('/api/table/download', methods=['POST'])
+# @require_solari_key
+# def download_table():
+#     """
+#     Test endpoint to download a table file from Firebase Storage using a Firestore source document.
+    
+#     Expected request body:
+#     {
+#         "team_id": "team123",
+#         "user_id": "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2",
+#         "agent_id": "agent123",
+#         "document_id": "MV9pGL1YP6iLdCeBxKay"
+#     }
+    
+#     Returns:
+#         JSON response with file metadata (row count, columns, types) and file size.
+#         Note: file_content is bytes and not included in JSON response, but file_size is provided.
+#     """
+#     try:
+#         # Get request data
+#         data = request.get_json()
+        
+#         if not data:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'Request body is required'
+#             }), 400
+        
+#         # Validate required fields
+#         team_id = data.get('team_id') or data.get('teamId')
+#         if not team_id:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'team_id parameter is required'
+#             }), 400
+
+#         user_id = data.get('user_id')
+#         if not user_id:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'user_id parameter is required'
+#             }), 400
+        
+#         agent_id = data.get('agent_id')
+#         if not agent_id:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'agent_id parameter is required'
+#             }), 400
+        
+#         document_id = data.get('document_id')
+#         if not document_id:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'document_id parameter is required'
+#             }), 400
+        
+#         logger.info(f"Testing download_table_from_source for team: {team_id}, user: {user_id}, agent: {agent_id}, document: {document_id}")
+        
+#         # Call the function
+#         result = download_table_from_source(team_id, user_id, agent_id, document_id)
+        
+#         # Prepare response (exclude file_content bytes, but include file size)
+#         response_data = {
+#             'status': 'success',
+#             'message': 'Successfully downloaded and analyzed table',
+#             'document_id': document_id,
+#             'file_path': result['file_path'],
+#             'file_size_bytes': len(result['file_content']),
+#             'row_count': result['row_count'],
+#             'columns': result['columns'],
+#             'column_count': result['column_count']
+#         }
+        
+#         logger.info(f"Test successful: {result['row_count']} rows, {result['column_count']} columns, {len(result['file_content'])} bytes")
+        
+#         return jsonify(response_data), 200
+        
+#     except ValueError as e:
+#         logger.error(f"Validation error: {str(e)}")
+#         return jsonify({
+#             'status': 'error',
+#             'message': str(e)
+#         }), 400
+#     except Exception as e:
+#         logger.error(f"Error downloading table: {str(e)}", exc_info=True)
+#         return jsonify({
+#             'status': 'error',
+#             'message': f'Failed to download table: {str(e)}'
+#         }), 500
+
+TABLE_LEASE_SECONDS = 120  # keep short; endpoint is doing the work synchronously
+
+@app.route("/api/table/analyze", methods=["POST"])
+@require_solari_key
+def analyze_table():
+    """
+    Creates an upload job AND runs analysis immediately.
+    Returns analysis metadata to the frontend.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        team_id = data.get("team_id") or data.get("teamId")
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        document_id = data.get("document_id") or data.get("documentId")
+
+        if not user_id:
+            return jsonify({"status": "error", "message": "user_id parameter is required"}), 400
+        if not agent_id:
+            return jsonify({"status": "error", "message": "agent_id parameter is required"}), 400
+        if not document_id:
+            return jsonify({"status": "error", "message": "document_id parameter is required"}), 400
+
+        db = firestore.client()
+
+        # Optional: allow team_id omitted
+        if not team_id:
+            try:
+                team_id = get_team_id_for_uid(db, user_id)
+            except Exception:
+                return jsonify({"status": "error", "message": "team_id parameter is required"}), 400
+
+        # Load agent source doc to get filePath
+        doc_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("sources").document(document_id)
+        )
+        snap = doc_ref.get()
+        if not snap.exists:
+            return jsonify({"status": "error", "message": f"Document not found: {document_id}"}), 404
+
+        doc_data = snap.to_dict() or {}
+        file_path = doc_data.get("filePath")
+        if not file_path:
+            return jsonify({"status": "error", "message": "filePath not found in document"}), 400
+
+        now_unix = int(time.time())
+
+        # --- Create an upload job doc under teams/{teamId}/upload_jobs/{jobId}
+        job_id = f"table_{now_unix}_{uuid.uuid4().hex[:8]}"
+        job_ref = (
+            db.collection("teams").document(team_id)
+              .collection("upload_jobs").document(job_id)
+        )
+
+        source_key = f"table:{document_id}"
+
+        # Mark analysis as processing on the agent source doc (canonical)
+        doc_ref.update({
+            "analysis_status": "processing",
+            "analysis_message": "Analyzing table",
+            "analysis_job_id": job_id,
+            "updated_at_unix": now_unix,
+        })
+
+        # Create job in "processing" so worker doesn't double-run while the API is running
+        job_ref.set({
+            "job_type": "analyze_table",
+            "connector": "table",
+            "team_id": team_id,
+            "agent_id": agent_id,
+            "created_by_user_id": user_id,
+
+            "status": "processing",
+            "message": "Processing",
+            "progress": 0,
+
+            "created_at_unix": now_unix,
+            "updated_at_unix": now_unix,
+            "expires_at_unix": now_unix + 30 * 24 * 3600,
+
+            "locked_by": "api",
+            "locked_until": utcnow() + timedelta(seconds=TABLE_LEASE_SECONDS),
+
+            "sources": [{
+                "source_key": source_key,
+                "type": "table",
+                "id": document_id,
+                "title": doc_data.get("nickname") or doc_data.get("name") or document_id,
+                "file_path": file_path,
+                "status": "processing",
+                "stage": "analyze",
+                "error": None,
+                "result": None,
+                "checkpoint": {},
+            }]
+        })
+
+        # --- Do the analysis now (synchronous)
+        logger.info(f"[table/analyze] downloading file: {file_path}")
+        file_content = download_file_from_firebase(file_path)
+
+        logger.info("[table/analyze] analyzing tabular data")
+        analysis_result = analyze_tabular_data(file_content, file_path)
+
+        row_count = int(analysis_result.get("row_count") or 0)
+        columns = analysis_result.get("columns") or {}
+        column_count = int(len(columns))
+
+        # --- Write canonical results on agent source doc
+        doc_ref.update({
+            "row_count": row_count,
+            "columns": columns,
+            "column_count": column_count,
+            "analysis_status": "done",
+            "analysis_message": "Table analyzed successfully",
+            "analyzed_at_unix": now_unix,
+            "updated_at_unix": now_unix,
+        })
+
+        # --- Mark job done
+        update_source(job_ref, source_key, {
+            "status": "done",
+            "stage": "done",
+            "error": None,
+            "result": {
+                "row_count": row_count,
+                "column_count": column_count,
+            }
+        })
+        update_job(job_ref, status="done", progress=100, message="Completed", updated_at_unix=now_unix)
+        update_job(job_ref, locked_by=None, locked_until=None, updated_at_unix=now_unix)
+
+        # --- Return what frontend expects
+        return jsonify({
+            "status": "success",
+            "message": "Table analyzed successfully",
+            "document_id": document_id,
+            "file_path": file_path,
+            "row_count": row_count,
+            "columns": columns,
+            "column_count": column_count,
+            "job_id": job_id,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error analyzing table: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to analyze table: {str(e)}"
         }), 500
 
 @app.route('/api/table/prepare', methods=['POST'])

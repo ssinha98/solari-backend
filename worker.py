@@ -129,6 +129,96 @@ def process_slack_source(db, job_ref, job, source):
     })
 
 # ======================
+# table helpers
+# ======================
+
+def process_table_source(db, job_ref, job, source):
+    team_id = job["team_id"]
+    agent_id = job["agent_id"]
+
+    document_id = source["id"]
+    source_key = source["source_key"]
+
+    # Pull file path from the agent source doc (canonical)
+    doc_ref = (
+        db.collection("teams").document(team_id)
+          .collection("agents").document(agent_id)
+          .collection("sources").document(document_id)
+    )
+    snap = doc_ref.get()
+    if not snap.exists:
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "fetch",
+            "error": f"agent_source_not_found:{document_id}",
+        })
+        return
+
+    doc_data = snap.to_dict() or {}
+    file_path = doc_data.get("filePath")
+    if not file_path:
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "fetch",
+            "error": "missing_filePath_on_agent_source",
+        })
+        return
+
+    now_unix = int(time.time())
+
+    # Mark stage
+    update_source(job_ref, source_key, {"status": "processing", "stage": "analyze", "error": None})
+    doc_ref.update({
+        "analysis_status": "processing",
+        "analysis_message": "Analyzing table",
+        "analysis_job_id": job_ref.id,
+        "updated_at_unix": now_unix,
+    })
+
+    try:
+        file_content = download_file_from_firebase(file_path)
+        analysis_result = analyze_tabular_data(file_content, file_path)
+
+        row_count = int(analysis_result.get("row_count") or 0)
+        columns = analysis_result.get("columns") or {}
+        column_count = int(len(columns))
+
+        # Canonical write
+        doc_ref.update({
+            "row_count": row_count,
+            "columns": columns,
+            "column_count": column_count,
+            "analysis_status": "done",
+            "analysis_message": "Table analyzed successfully",
+            "analyzed_at_unix": now_unix,
+            "updated_at_unix": now_unix,
+        })
+
+        # Job UI write
+        update_source(job_ref, source_key, {
+            "status": "done",
+            "stage": "done",
+            "error": None,
+            "result": {
+                "row_count": row_count,
+                "column_count": column_count,
+            }
+        })
+
+    except Exception as e:
+        err = str(e)
+        doc_ref.update({
+            "analysis_status": "error",
+            "analysis_message": err,
+            "updated_at_unix": now_unix,
+        })
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "analyze",
+            "error": err,
+        })
+
+# ======================
 # FIRESTORE JOB HELPERS
 # ======================
 
@@ -828,6 +918,10 @@ def process_job(db, job_ref):
         
         if source["type"] == "jira":
             process_jira_source(db, job_ref, job, source)
+            completed += 1
+
+        if source["type"] == "table":
+            process_table_source(db, job_ref, job, source)
             completed += 1
 
         update_job(
