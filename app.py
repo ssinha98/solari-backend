@@ -3121,142 +3121,243 @@ def scrape_website_with_firecrawl(url: str) -> dict:
 
 # Add this endpoint after the pinecone_doc_upload endpoint (around line 544)
 
-@app.route('/api/pinecone_website_upload', methods=['POST'])
+@app.post("/api/website/add_urls")
 @require_solari_key
-def pinecone_website_upload():
+def website_add_urls():
     """
-    Upload website content to Pinecone after scraping and processing.
-    
-    Expected request body:
+    Enqueue website ingestion job.
+
+    Request body:
     {
-        "namespace": "your-namespace",
-        "url": "https://example.com",
-        "nickname": "optional-nickname",  # optional
-        "chunk_size": 1000,  # optional, default 1000
-        "chunk_overlap": 200  # optional, default 200
+      "user_id": "...",
+      "team_id": "...",          # optional (derive if missing)
+      "agent_id": "...",
+      "sites": [
+        { "url": "https://example.com", "nickname": "optional" }
+      ]
     }
-    
-    Process:
-    1. Scrape website URL with Firecrawl to get markdown
-    2. Chunk the markdown
-    3. Generate embeddings using OpenAI
-    4. Upload to Pinecone
-    
-    Returns:
-        JSON response with upload status
     """
-    try:
-        # Get request data
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Request body is required'
-            }), 400
-        
-        # Validate required fields
-        namespace = data.get('namespace')
-        if not namespace:
-            return jsonify({
-                'status': 'error',
-                'message': 'namespace parameter is required'
-            }), 400
-        
-        url = data.get('url')
+    body = request.get_json(force=True) or {}
+
+    user_id = body.get("user_id")
+    team_id = body.get("team_id") or body.get("teamId")
+    agent_id = body.get("agent_id")
+    sites = body.get("sites") or body.get("urls")  # allow either key
+
+    if not user_id:
+        return jsonify({"status": "failure", "error": "user_id is required"}), 400
+    if not agent_id:
+        return jsonify({"status": "failure", "error": "agent_id is required"}), 400
+    if not isinstance(sites, list) or not sites:
+        return jsonify({"status": "failure", "error": "sites must be a non-empty list"}), 400
+
+    db = firestore.client()
+    if not team_id:
+        team_id = get_team_id_for_uid(db, user_id)
+
+    sources = []
+    for s in sites:
+        if not isinstance(s, dict):
+            return jsonify({"status": "failure", "error": "each site must be an object"}), 400
+
+        url = (s.get("url") or "").strip()
+        nickname = (s.get("nickname") or "").strip()
+
         if not url:
-            return jsonify({
-                'status': 'error',
-                'message': 'url parameter is required'
-            }), 400
+            return jsonify({"status": "failure", "error": "each site must include url"}), 400
+
+        source_key = f"website:{url}"
+
+        sources.append({
+            "source_key": source_key,
+            "type": "website",
+            "id": url,
+            "title": nickname or url,
+            "url": url,
+            "nickname": nickname or "",
+            "status": "queued",
+            "stage": "queued",
+            "checkpoint": {
+                "chunk_index": 0,
+                "total_chunks": None,
+            },
+            "error": None,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30)
+
+    job_id = uuid.uuid4().hex
+    job_ref = (
+        db.collection("teams").document(team_id)
+          .collection("upload_jobs").document(job_id)
+    )
+
+    job_ref.set({
+        "job_type": "ingest_sources",
+        "connector": "website",
+        "status": "queued",
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": expires_at,
+
+        "locked_by": None,
+        "locked_until": None,
+
+        "progress": 0,
+        "message": "Queued",
+        "created_by_user_id": user_id,
+
+        "team_id": team_id,
+        "agent_id": agent_id,
+
+        "sources": sources,
+    })
+
+    return jsonify({
+        "status": "success",
+        "job_id": job_id,
+        "team_id": team_id,
+        "queued_sources": len(sources),
+    }), 200
+
+# @app.route('/api/pinecone_website_upload', methods=['POST'])
+# @require_solari_key
+# def pinecone_website_upload():
+#     """
+#     Upload website content to Pinecone after scraping and processing.
+    
+#     Expected request body:
+#     {
+#         "namespace": "your-namespace",
+#         "url": "https://example.com",
+#         "nickname": "optional-nickname",  # optional
+#         "chunk_size": 1000,  # optional, default 1000
+#         "chunk_overlap": 200  # optional, default 200
+#     }
+    
+#     Process:
+#     1. Scrape website URL with Firecrawl to get markdown
+#     2. Chunk the markdown
+#     3. Generate embeddings using OpenAI
+#     4. Upload to Pinecone
+    
+#     Returns:
+#         JSON response with upload status
+#     """
+#     try:
+#         # Get request data
+#         data = request.get_json()
         
-        # Optional parameters with defaults
-        chunk_size = data.get('chunk_size', 1000)
-        chunk_overlap = data.get('chunk_overlap', 200)
-        nickname = data.get('nickname', '')
+#         if not data:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'Request body is required'
+#             }), 400
         
-        logger.info(f"Processing website: {url} for namespace: {namespace}")
+#         # Validate required fields
+#         namespace = data.get('namespace')
+#         if not namespace:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'namespace parameter is required'
+#             }), 400
         
-        # Step 1: Scrape website with Firecrawl
-        logger.info("Scraping website with Firecrawl...")
-        scrape_result = scrape_website_with_firecrawl(url)
-        markdown = scrape_result["markdown"]
-        website_metadata = scrape_result["metadata"]
+#         url = data.get('url')
+#         if not url:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'url parameter is required'
+#             }), 400
         
-        if not markdown or len(markdown.strip()) == 0:
-            return jsonify({
-                'status': 'error',
-                'message': 'No content could be extracted from the website'
-            }), 400
+#         # Optional parameters with defaults
+#         chunk_size = data.get('chunk_size', 1000)
+#         chunk_overlap = data.get('chunk_overlap', 200)
+#         nickname = data.get('nickname', '')
         
-        logger.info(f"Extracted {len(markdown)} characters of markdown")
+#         logger.info(f"Processing website: {url} for namespace: {namespace}")
         
-        # Step 2: Chunk the markdown
-        logger.info("Chunking markdown...")
-        text_chunks = chunk_text(markdown, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        logger.info(f"Created {len(text_chunks)} chunks")
+#         # Step 1: Scrape website with Firecrawl
+#         logger.info("Scraping website with Firecrawl...")
+#         scrape_result = scrape_website_with_firecrawl(url)
+#         markdown = scrape_result["markdown"]
+#         website_metadata = scrape_result["metadata"]
         
-        # Step 3: Generate embeddings
-        logger.info("Generating embeddings...")
-        openai_client = get_openai_client()
-        embeddings = generate_embeddings(text_chunks, openai_client)
+#         if not markdown or len(markdown.strip()) == 0:
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'No content could be extracted from the website'
+#             }), 400
         
-        # Step 4: Prepare vectors for Pinecone
-        # Sanitize URL for use in IDs
-        url_id_base = url.replace('https://', '').replace('http://', '').replace('/', '_').replace(' ', '_').replace('.', '_')
-        # Remove any remaining special characters that might cause issues
-        url_id_base = ''.join(c if c.isalnum() or c == '_' else '_' for c in url_id_base)
+#         logger.info(f"Extracted {len(markdown)} characters of markdown")
         
-        vectors = []
-        for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
-            vectors.append({
-                'id': f"{url_id_base}_chunk_{i}",
-                'values': embedding,
-                'metadata': {
-                    'url': url,
-                    'chunk_index': i,
-                    'text_preview': chunk[:500],  # Store first 500 chars as metadata
-                    'source': 'website',
-                    'nickname': nickname,  # Add nickname to metadata
-                    # Include relevant metadata from Firecrawl
-                    'title': website_metadata.get('title', ''),
-                    'description': website_metadata.get('description', ''),
-                    'sourceURL': website_metadata.get('sourceURL', url),
-                }
-            })
+#         # Step 2: Chunk the markdown
+#         logger.info("Chunking markdown...")
+#         text_chunks = chunk_text(markdown, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+#         logger.info(f"Created {len(text_chunks)} chunks")
         
-        # Step 5: Upload to Pinecone in batches
-        logger.info(f"Uploading {len(vectors)} vectors to Pinecone in batches...")
-        index_name = 'production'
-        total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+#         # Step 3: Generate embeddings
+#         logger.info("Generating embeddings...")
+#         openai_client = get_openai_client()
+#         embeddings = generate_embeddings(text_chunks, openai_client)
         
-        logger.info(f"Successfully uploaded {total_uploaded} vectors to namespace '{namespace}'")
+#         # Step 4: Prepare vectors for Pinecone
+#         # Sanitize URL for use in IDs
+#         url_id_base = url.replace('https://', '').replace('http://', '').replace('/', '_').replace(' ', '_').replace('.', '_')
+#         # Remove any remaining special characters that might cause issues
+#         url_id_base = ''.join(c if c.isalnum() or c == '_' else '_' for c in url_id_base)
         
-        return jsonify({
-            'status': 'success',
-            'message': f'Successfully processed and uploaded {len(vectors)} vectors to namespace "{namespace}"',
-            'namespace': namespace,
-            'index': index_name,
-            'url': url,
-            'vectors_uploaded': len(vectors),
-            'chunks_created': len(text_chunks),
-            'markdown_length': len(markdown),
-            'website_metadata': website_metadata,
-            'nickname': nickname
-        }), 200
+#         vectors = []
+#         for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
+#             vectors.append({
+#                 'id': f"{url_id_base}_chunk_{i}",
+#                 'values': embedding,
+#                 'metadata': {
+#                     'url': url,
+#                     'chunk_index': i,
+#                     'text_preview': chunk[:500],  # Store first 500 chars as metadata
+#                     'source': 'website',
+#                     'nickname': nickname,  # Add nickname to metadata
+#                     # Include relevant metadata from Firecrawl
+#                     'title': website_metadata.get('title', ''),
+#                     'description': website_metadata.get('description', ''),
+#                     'sourceURL': website_metadata.get('sourceURL', url),
+#                 }
+#             })
         
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 400
-    except Exception as e:
-        logger.error(f"Error processing website: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Failed to process website: {str(e)}'
-        }), 500
+#         # Step 5: Upload to Pinecone in batches
+#         logger.info(f"Uploading {len(vectors)} vectors to Pinecone in batches...")
+#         index_name = 'production'
+#         total_uploaded = upload_vectors_to_pinecone(vectors, namespace, index_name=index_name, batch_size=100)
+        
+#         logger.info(f"Successfully uploaded {total_uploaded} vectors to namespace '{namespace}'")
+        
+#         return jsonify({
+#             'status': 'success',
+#             'message': f'Successfully processed and uploaded {len(vectors)} vectors to namespace "{namespace}"',
+#             'namespace': namespace,
+#             'index': index_name,
+#             'url': url,
+#             'vectors_uploaded': len(vectors),
+#             'chunks_created': len(text_chunks),
+#             'markdown_length': len(markdown),
+#             'website_metadata': website_metadata,
+#             'nickname': nickname
+#         }), 200
+        
+#     except ValueError as e:
+#         logger.error(f"Validation error: {str(e)}")
+#         return jsonify({
+#             'status': 'error',
+#             'message': str(e)
+#         }), 400
+#     except Exception as e:
+#         logger.error(f"Error processing website: {str(e)}", exc_info=True)
+#         return jsonify({
+#             'status': 'error',
+#             'message': f'Failed to process website: {str(e)}'
+#         }), 500
 
 @app.route('/api/pinecone_slack_upload', methods=['POST'])
 @require_solari_key

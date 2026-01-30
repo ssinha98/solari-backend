@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-
+import re
 import requests
 from firebase_admin import firestore
 
@@ -41,6 +41,7 @@ from app import (
     _merge_jira_tickets,
     download_file_from_firebase,
     extract_text_from_file,
+    scrape_website_with_firecrawl
     )
 
 # ======================
@@ -421,7 +422,7 @@ def process_jira_source(db, job_ref, job, source):
         agent_sources_ref.document(agent_jira_doc.id).update({
             "nickname": "jira",
             "tickets": merged,
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": utcnow(),
         })
     else:
         agent_sources_ref.add({
@@ -429,8 +430,8 @@ def process_jira_source(db, job_ref, job, source):
             "nickname": "jira",
             "agent_id": agent_id,
             "tickets": [ticket],
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "created_at": utcnow(),
+            "updated_at": utcnow(),
         })
 
     # ---- Upsert team-level Jira source (single doc with tickets array) ----
@@ -444,15 +445,15 @@ def process_jira_source(db, job_ref, job, source):
         team_sources_ref.document(team_jira_doc.id).update({
             "nickname": "jira",
             "tickets": merged,
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": utcnow(),
         })
     else:
         team_sources_ref.add({
             "type": "jira",
             "nickname": "jira",
             "tickets": [ticket],
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "created_at": utcnow(),
+            "updated_at": utcnow(),
         })
 
     update_source(job_ref, source["source_key"], {
@@ -589,6 +590,115 @@ def process_doc_source(db, job_ref, job, source):
         },
         "updated_at": utcnow(),
     })
+
+# ======================
+# JOB PROCESSOR
+# ======================
+def _safe_url_id(url: str) -> str:
+    # Similar to your old logic but safer/shorter.
+    u = url.strip()
+    u = re.sub(r"^https?://", "", u)
+    u = u.replace("/", "_").replace(" ", "_").replace(".", "_")
+    u = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in u)
+    return u[:180] if len(u) > 180 else u
+def process_website_source(db, job_ref, job, source):
+    """
+    Process one website source from upload_jobs.sources[].
+    Uses existing helpers from app.py (import them in worker.py).
+    """
+    team_id = job["team_id"]
+    agent_id = job["agent_id"]
+    user_id = job["created_by_user_id"]
+
+    url = (source.get("url") or source.get("id") or "").strip()
+    nickname = (source.get("nickname") or "").strip()
+    source_key = source["source_key"]
+
+    if not url:
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "error",
+            "error": "missing_url",
+        })
+        return
+
+    update_source(job_ref, source_key, {"status": "processing", "stage": "scrape", "error": None})
+
+    # Derive namespace from Firebase (your rule)
+    namespace = _get_team_pinecone_namespace(db, team_id)
+
+    # 1) Scrape
+    scrape_result = scrape_website_with_firecrawl(url)
+    markdown = (scrape_result or {}).get("markdown") or ""
+    website_metadata = (scrape_result or {}).get("metadata") or {}
+
+    if not markdown.strip():
+        update_source(job_ref, source_key, {
+            "status": "error",
+            "stage": "error",
+            "error": "no_content_extracted",
+        })
+        return
+
+    # 2) Chunk
+    update_source(job_ref, source_key, {"stage": "chunk"})
+    chunks = chunk_text(markdown, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFAULT_CHUNK_OVERLAP)
+
+    checkpoint = source.get("checkpoint") or {}
+    start_i = int(checkpoint.get("chunk_index") or 0)
+
+    update_source(job_ref, source_key, {
+        "stage": "embed",
+        "checkpoint": {
+            "chunk_index": start_i,
+            "total_chunks": len(chunks),
+        }
+    })
+
+    # 3) Embed + upload
+    openai_client = get_openai_client()
+    index_name = "production"
+    url_id_base = _safe_url_id(url)
+
+    for i in range(start_i, len(chunks)):
+        emb = generate_embeddings([chunks[i]], openai_client)[0]
+
+        vector_id = f"website_{team_id}_{url_id_base}_chunk_{i}"
+        vector_id = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in vector_id)
+
+        vectors = [{
+            "id": vector_id,
+            "values": emb,
+            "metadata": {
+                "source": "website",
+                "team_id": team_id,
+                "agent_id": agent_id,
+                "url": url,
+                "nickname": nickname,
+                "chunk_index": i,
+                "text_preview": chunks[i][:500],
+                "title": website_metadata.get("title", ""),
+                "description": website_metadata.get("description", ""),
+                "sourceURL": website_metadata.get("sourceURL", url),
+            }
+        }]
+
+        upload_vectors_to_pinecone(
+            vectors=vectors,
+            namespace=namespace,
+            index_name=index_name,
+            batch_size=1,
+        )
+
+        # checkpoint after each chunk
+        update_source(job_ref, source_key, {
+            "checkpoint": {
+                "chunk_index": i + 1,
+                "total_chunks": len(chunks),
+            }
+        })
+
+    update_source(job_ref, source_key, {"status": "done", "stage": "done"})
 # ======================
 # JOB PROCESSOR
 # ======================
@@ -611,6 +721,10 @@ def process_job(db, job_ref):
 
         if source["type"] == "confluence":
             process_confluence_source(db, job_ref, job, source)
+            completed += 1
+
+        if source["type"] == "website":
+            process_website_source(db, job_ref, job, source)
             completed += 1
         
         if source["type"] == "doc":
