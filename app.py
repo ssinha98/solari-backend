@@ -2579,6 +2579,22 @@ def send_welcome_email():
         if not to_email:
             return jsonify({"success": False, "error": "user_email_missing"}), 400
 
+        team_id = (user_data.get("teamId") or "").strip()
+        if not team_id:
+            return jsonify({"success": False, "error": "team_id_missing"}), 400
+
+        team_user_snap = (
+            db.collection("teams").document(team_id)
+              .collection("users").document(str(user_id)).get()
+        )
+        if not team_user_snap.exists:
+            return jsonify({"success": False, "error": "team_user_not_found"}), 404
+
+        team_user_data = team_user_snap.to_dict() or {}
+        show_onboarding = team_user_data.get("show_onboarding")
+        if show_onboarding is False:
+            return jsonify({"success": True, "skipped": True, "reason": "show_onboarding_false"}), 200
+
         subject, text_body, html_body = build_signup_welcome_email(user_data)
         response = send_email(to_email, subject, text_body, html_body=html_body or None)
         if not response or response.status_code != 200:
