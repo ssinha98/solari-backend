@@ -39,6 +39,8 @@ from app import (
     pinecone_slack_upload_internal, 
     _build_jira_ticket_text,
     _merge_jira_tickets,
+    download_file_from_firebase,
+    extract_text_from_file,
     )
 
 # ======================

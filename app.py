@@ -2994,6 +2994,7 @@ def pinecone_doc_upload():
       "file_path": "teams/{teamId}/sources/{sourceId}/.../file.pdf" OR "users/{uid}/.../file.pdf",
       "nickname": "optional"
     }
+    # namespace is derived from the team doc
     """
     body = request.get_json(force=True) or {}
     user_id = body.get("user_id") or body.get("uid")
@@ -3010,6 +3011,7 @@ def pinecone_doc_upload():
 
     db = firestore.client()
     team_id = get_team_id_for_uid(db, user_id)
+    namespace = _get_team_pinecone_namespace(db, team_id)
 
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=30)
@@ -3030,6 +3032,7 @@ def pinecone_doc_upload():
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
         "expires_at": expires_at,
+        "namespace": namespace,
 
         "locked_by": None,
         "locked_until": None,
@@ -3046,6 +3049,7 @@ def pinecone_doc_upload():
             "id": file_path,          # keep it simple: id == file_path
             "file_path": file_path,
             "nickname": nickname or None,
+            "namespace": namespace,
 
             "status": "queued",
             "stage": "queued",
