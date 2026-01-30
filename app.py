@@ -190,7 +190,7 @@ def send_email(to_email, subject, body, html_body=None):
         return None
 
     payload = {
-        "from": "Team Robots @ Solari <postmaster@robots.usesolari.ai>",
+        "from": "Sahil's Robots @ Solari <postmaster@robots.usesolari.ai>",
         "to": to_email,
         "subject": subject,
         "text": body,
@@ -209,6 +209,65 @@ def send_email(to_email, subject, body, html_body=None):
     except Exception as e:
         logger.error(f"Error sending email: {str(e)}")
         return None
+
+def build_signup_welcome_email(user_data: dict):
+    display_name = (user_data.get("displayName") or user_data.get("name") or "").strip()
+    first_name = display_name.split()[0] if display_name else ""
+    greeting = f"Hey {first_name}!" if first_name else "Hey!"
+
+    calendar_url = os.getenv(
+        "WELCOME_CALENDAR_URL",
+        "https://cal.com/sahil-sinha-hugr4z/solari-onboarding",
+    )
+    docs_url = "https://docs.usesolari.ai"
+
+    subject = "Welcome to Solari 👋"
+    text_body = (
+        f"{greeting}\n\n"
+        "Welcome to Solari! I'm Sahil, I'm the CEO and Founder of Solari AI. "
+        "I'd love to help you and your team set up your Solari account for success. "
+        "If you've got the time, I'd love to onboard you personally, and get to know "
+        "more about you and your team! You can always grab time on my calendar here: "
+        f"{calendar_url}\n\n"
+        "(No worries if you can't decide yet — I'll follow up in a few days as well.)\n\n"
+        f"You can also get set up yourself using our docs ({docs_url}). "
+        "(If you're looking for somewhere to start, I'd recommend creating your own "
+        "Chat (RAG) Agent, and connecting either a Slack channel or a website as a "
+        "source, and start playing around with Solari!\n\n)"
+        "If you have any questions, need some last mile configurations, or need help "
+        "thinking through what agents could help your team — I'd love to chat: "
+        f"{calendar_url}\n\n"
+        "Cheers,\n"
+        "Sahil"
+    )
+    create_agent_url = "https://docs.usesolari.ai/essentials/create-agent#create-agent"
+    slack_connect_url = "https://docs.usesolari.ai/guides/getting-started-in-solari/integrations/slack"
+    slack_channels_url = "https://docs.usesolari.ai/essentials/add_sources#slack-channels"
+    website_sources_url = "https://docs.usesolari.ai/essentials/add_sources#websites"
+    run_query_url = "https://docs.usesolari.ai/guides/running-your-agents/run-query"
+
+    html_body = (
+        f"{greeting}<br><br>"
+        "Welcome to Solari! I'm Sahil, I'm the CEO and Founder of Solari AI. "
+        "I'd love to help you and your team set up your Solari account for success. "
+        "If you've got the time, I'd love to onboard you personally, and get to know "
+        "more about you and your team! You can always grab time on my calendar here: "
+        f'<a href="{calendar_url}">{calendar_url}</a><br><br>'
+        "(No worries if you can't decide yet — I'll follow up in a few days as well.)<br><br>"
+        f'You can also get set up yourself using our <a href="{docs_url}">docs</a>. '
+        "If you're looking for somewhere to start, I'd recommend "
+        f'<a href="{create_agent_url}">creating your own Chat (RAG) Agent</a>, and '
+        f'<a href="{slack_connect_url}">connecting</a> either a '
+        f'<a href="{slack_channels_url}">Slack channel</a> or a '
+        f'<a href="{website_sources_url}">website</a> as a source, and start '
+        f'<a href="{run_query_url}">playing around with Solari</a>!<br><br>'
+        "If you have any questions, need some last mile configurations, or need help "
+        "thinking through what agents could help your team — I'd love to chat: "
+        f'<a href="{calendar_url}">{calendar_url}</a><br><br>'
+        "Cheers,<br>"
+        "Sahil"
+    )
+    return subject, text_body, html_body
 
 def update_job(
     job_ref,
@@ -2497,6 +2556,38 @@ def invite_team_members():
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/user/send_welcome_email', methods=['POST', 'OPTIONS'])
+@require_solari_key
+def send_welcome_email():
+    if request.method == "OPTIONS":
+        return add_cors_headers(make_response()), 204
+
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("userId") or data.get("user_id")
+        if not user_id:
+            return jsonify({"success": False, "error": "missing_user_id"}), 400
+
+        db = firestore.client()
+        user_snap = db.collection("users").document(str(user_id)).get()
+        if not user_snap.exists:
+            return jsonify({"success": False, "error": "user_not_found"}), 404
+
+        user_data = user_snap.to_dict() or {}
+        to_email = (user_data.get("email") or "").strip()
+        if not to_email:
+            return jsonify({"success": False, "error": "user_email_missing"}), 400
+
+        subject, text_body, html_body = build_signup_welcome_email(user_data)
+        response = send_email(to_email, subject, text_body, html_body=html_body or None)
+        if not response or response.status_code != 200:
+            return jsonify({"success": False, "error": "email_send_failed"}), 500
+
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        logger.error(f"Error sending welcome email: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/agent/add_members', methods=['POST', 'OPTIONS'])
 @require_solari_key
