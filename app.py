@@ -135,7 +135,8 @@ FRONTEND_SUCCESS_URL = os.getenv('FRONTEND_SUCCESS_URL', 'http://localhost:3000'
 SOLARI_INTERNAL_KEY = os.environ.get("SOLARI_INTERNAL_KEY")
 SOLARI_DEV_KEY = os.environ.get("SOLARI_DEV_KEY")
 SOLARI_KEY_HEADER = "x-solari-key"
-utcnow = datetime.now(timezone.utc)
+def utcnow():
+    return datetime.now(timezone.utc)
 
 def _is_valid_solari_key(key: str | None) -> bool:
     if not key:
@@ -3473,7 +3474,7 @@ def slack_add_channels_enqueue():
         return jsonify({"ok": False, "error": "missing_channels"}), 400
 
     db = firestore.client()
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     # ✅ Always derive team_id from uid
     try:
@@ -3521,7 +3522,7 @@ def slack_add_channels_enqueue():
     if not sources:
         return jsonify({"ok": False, "error": "no_valid_channels"}), 400
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     expires_at = now + timedelta(days=30)
 
     job_id = uuid.uuid4().hex
@@ -7294,7 +7295,7 @@ def confluence_add_pages():
         team_id = get_team_id_for_uid(db, user_id)
         logger.info("Resolved team_id for user", extra={"user_id": user_id, "team_id": team_id})
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         # Build sources array
         sources = []
         for page in pages:
