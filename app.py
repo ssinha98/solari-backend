@@ -3,6 +3,7 @@ import json
 import io
 import tempfile
 import time
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, request, make_response, redirect
@@ -12,8 +13,7 @@ from dotenv import load_dotenv
 from pinecone import (Pinecone)
 from pinecone.grpc import PineconeGRPC
 import logging
-import firebase_admin
-from firebase_admin import credentials, storage, auth, firestore
+from firebase_config import db, firestore, auth, storage
 from openai import OpenAI
 import PyPDF2
 from docx import Document
@@ -34,6 +34,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 import html
 import stripe
 import urllib.parse
+from pydantic import BaseModel
 
 # from typing import List
 # Load environment variables from .env file
@@ -342,43 +343,6 @@ def handle_preflight():
         return add_cors_headers(response), 204
     return None
 
-# Initialize Firebase Admin SDK
-def initialize_firebase():
-    """Initialize Firebase Admin SDK with service account credentials"""
-    try:
-        # Check if Firebase is already initialized
-        try:
-            firebase_admin.get_app()
-            logger.info("Firebase Admin SDK already initialized")
-            return
-        except ValueError:
-            pass  # Not initialized yet, continue
-        
-        # Get credentials and storage bucket from environment
-        credentials_json = get_env_var('FIREBASE_CREDENTIALS', required=True)
-        storage_bucket = get_env_var('FIREBASE_STORAGE_BUCKET', required=True)
-        
-        # Parse JSON credentials
-        try:
-            cred_dict = json.loads(credentials_json)
-            cred = credentials.Certificate(cred_dict)
-            logger.info("Firebase credentials loaded from JSON")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in FIREBASE_CREDENTIALS: {str(e)}")
-        
-        # Initialize Firebase app with storage bucket
-        firebase_admin.initialize_app(cred, {
-            'storageBucket': storage_bucket
-        })
-        
-        logger.info(f"Firebase Admin SDK initialized successfully with bucket: {storage_bucket}")
-    except Exception as e:
-        logger.error(f"Failed to initialize Firebase: {str(e)}")
-        raise
-
-# Initialize Firebase on startup
-initialize_firebase()
-
 # Firebase connection test function
 def test_firebase_connection():
     """
@@ -440,9 +404,6 @@ def test_firebase_connection():
         }
     
     return results
-
-# set up firebase client
-db = firestore.client()
 
 # Initialize Pinecone client
 def get_pinecone_client():
@@ -952,6 +913,49 @@ def _log(obj, label=""):
     except Exception as e:
         print(f"\n===== {label} (failed to json dump: {e}) =====")
         print(str(obj)[:8000])
+
+
+@app.route('/api/get-team-id', methods=['POST'])
+@require_solari_key
+def get_team_id():
+    """
+    Get the team ID for a given user.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+
+        if not user_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameter: user_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "team_id": team_id
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_team_id: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 @app.route("/api/stripe/webhook", methods=["POST"])
 def stripe_webhook():
@@ -5006,6 +5010,10 @@ CRITICAL FORMAT RULES:
    - Example OK: ["month"]
    - Example NOT OK: ["sum(revenue_usd) as total_sales"]
 
+1b) Aggregations + grouping rule:
+    - If metrics is non-empty and groupby is empty, select MUST be [].
+    - If you need dimensions, put them in groupby (and optionally in select).
+
 2) metrics MUST be a list of objects in this exact shape:
    {"agg": "<agg>", "col": "<column_name or null>", "as": "<alias>"}
    - agg must be one of: sum, avg, min, max, count
@@ -5850,22 +5858,25 @@ def plan_to_sql(plan: Dict[str, Any]) -> str:
     # Build SELECT clause
     select_parts = []
     
-    # Get columns that are being aggregated in metrics
-    # When there's a GROUP BY, we shouldn't include these columns as raw columns in SELECT
+    # Get columns that are being aggregated in metrics.
+    # If there are metrics and no GROUP BY, do not include raw columns in SELECT.
     groupby_cols = plan.get("groupby", [])
+    has_metrics = bool(plan.get("metrics"))
     aggregated_cols = set()
     for metric in plan.get("metrics", []):
         col = metric.get("col")
         if col:
             aggregated_cols.add(col)
     
-    # Add select columns (but exclude columns that are being aggregated if there's a GROUP BY)
-    for col in plan.get("select", []):
-        # If there's a GROUP BY and this column is being aggregated, skip it
-        # The aggregate will provide the value, so we don't need the raw column
-        if groupby_cols and col in aggregated_cols:
-            continue
-        select_parts.append(f'"{col}"')
+    # Add select columns (but exclude columns that are being aggregated if there's a GROUP BY).
+    # If metrics exist without GROUP BY, drop raw select columns to avoid invalid SQL.
+    if not (has_metrics and not groupby_cols):
+        for col in plan.get("select", []):
+            # If there's a GROUP BY and this column is being aggregated, skip it
+            # The aggregate will provide the value, so we don't need the raw column
+            if groupby_cols and col in aggregated_cols:
+                continue
+            select_parts.append(f'"{col}"')
     
     # Add metrics/aggregations
     for metric in plan.get("metrics", []):
@@ -10230,6 +10241,1932 @@ def _get_team_creator_first_name(team_id: str, user_id: str):
 
     first_name = display_name.split()[0]
     return first_name, creator_uid, None
+
+# STUFF FOR MAKING DEMOS
+# Demo mode: pre-set responses for scripted agent demos (suggestion steps + answer steps).
+demo_response_list = [
+    # Where in the funnel are we seeing the biggest drop-off?
+# Read the call transcript and extract the company profile and their needs in an invoicing tool
+{
+    "success": True,
+    "answer": (
+        "**Company Profile**\n\n"
+        "- **Company:** Mercer & Klein Logistics\n"
+        "- **Industry:** Freight & Supply Chain\n"
+        "- **Size:** ~120 employees, operating across 3 regional offices\n"
+        "- **Current tools:** QuickBooks for accounting, spreadsheets for invoice tracking\n"
+        "- **Decision maker on the call:** Dana Pollard, Head of Finance\n\n"
+
+        "**Invoicing Needs**\n\n"
+        "- Ability to handle high invoice volumes — they're processing ~400 invoices per month and the current setup is creating bottlenecks.\n"
+        "- They need automated payment reminders — late payments are a recurring issue and a manual chasing process is eating up the finance team's time.\n"
+        "- Integration with QuickBooks is essential; they have no appetite to replace their accounting stack.\n"
+        "- Mobile access for approvals was flagged as a nice-to-have by Dana, as the ops team is frequently on the road."
+    ),
+    "requestId": None,
+    "suggestedSource": None,
+    "metadata": {
+        "userid": "",
+        "namespace": "",
+        "query": "Read the call transcript and extract company profile and invoicing needs",
+        "chunks_used": 0,
+        "context_length": 0,
+        "retrieved_chunks": [],
+        "nickname_filter": "#sales-call-transcripts",
+        "chosen_nickname": "#sales-call-transcripts",
+        "source_type_filter": None
+    }
+}, 
+# What are the top 3 risks to de-risk before progressing this lead?
+{
+    "success": True,
+    "answer": (
+        "**Top 3 Risks to De-Risk — Mercer & Klein Logistics**\n\n"
+        "- **International payments & multi-currency support:** The transcript confirms they work with suppliers across the US, Canada, and Germany but the full scope of their international payment needs wasn't fully explored. Before progressing, confirm whether they need to send and receive payments in foreign currencies, and whether FX conversion or local payment rails are a requirement — this could be a dealbreaker if not supported.\n\n"
+        "- **Inventory management integrations:** Dana didn't mention inventory tooling directly but given they're a freight and logistics operation it's likely they're running warehouse or inventory management software that would need to connect with any new invoicing solution. This needs to be confirmed before a proposal goes out — an undisclosed integration requirement at a late stage could stall or kill the deal.\n\n"
+        "- **QuickBooks integration depth:** While QuickBooks compatibility was flagged as essential, the conversation didn't get into the specifics of how deeply they rely on it — whether they need two-way sync, real-time reconciliation, or just basic data export. A mismatch in integration capability vs. expectation is the most likely technical objection to surface later and should be scoped early."
+    ),
+    "requestId": None,
+    "suggestedSource": None,
+    "metadata": {
+        "userid": "",
+        "namespace": "",
+        "query": "What are the top 3 risks to de-risk before progressing this lead?",
+        "chunks_used": 0,
+        "context_length": 0,
+        "retrieved_chunks": [],
+        "nickname_filter": "#sales-call-transcripts",
+        "chosen_nickname": "#sales-call-transcripts",
+        "source_type_filter": None
+    }
+}
+]
+
+_demo_step_counter = 0
+
+@app.route('/api/chat-agent-demo', methods=['POST'])
+@require_solari_key
+def chat_agent_demo():
+    """
+    Demo endpoint for scripted agent flows. Returns pre-set responses from demo_response_list
+    in order. A module-level counter starts at 0 and increments on each request; set
+    _demo_step_counter = 0 in app.py when you want to start a new demo.
+
+    Request body:
+        requestId, suggestedSource: optional, merged into the returned step.
+    """
+    global _demo_step_counter
+    try:
+        data = request.get_json() or {}
+        n = len(demo_response_list)
+        # Once we've served all items, keep returning the last one (no wrap to 0)
+        step_index = min(_demo_step_counter, n - 1) if n else 0
+        logger.info(f"chat-agent-demo: step_index={step_index}, _demo_step_counter={_demo_step_counter}, list_len={n}")
+        response = dict(demo_response_list[step_index])
+        _demo_step_counter += 1
+
+        request_id = data.get('requestId')
+        suggested_source = data.get('suggestedSource')
+        if request_id is not None:
+            response['requestId'] = request_id
+        if suggested_source is not None and 'suggestedSource' in response:
+            response['suggestedSource'] = suggested_source
+        return jsonify(response), 200
+    except Exception as e:
+        logger.error(f"Error in chat-agent-demo: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'answer': None,
+            'metadata': None,
+            'error': f'Failed to process chat-agent-demo: {str(e)}',
+            'requestId': None
+        }), 500
+
+@app.route('/api/demo-add-source', methods=['POST'])
+@require_solari_key
+def demo_add_source():
+    """
+    Add a source document to an agent for demo use. Writes to teams/{team_id}/agents/{agent_id}/sources.
+
+    Request body:
+        team_id (required), agent_id (required).
+        Optional fields stored as-is: nickname, type, name, description, filepath, title, url, id.
+    """
+    try:
+        data = request.get_json() or {}
+        team_id = data.get('team_id')
+        agent_id = data.get('agent_id')
+        if not team_id or not agent_id:
+            return jsonify({'success': False, 'error': 'team_id and agent_id are required'}), 400
+
+        allowed = ('nickname', 'type', 'name', 'description', 'filepath', 'title', 'url', 'id')
+        payload = {k: data[k] for k in allowed if k in data and data[k] is not None}
+
+        db = firestore.client()
+        sources_ref = (
+            db.collection('teams').document(team_id)
+            .collection('agents').document(agent_id)
+            .collection('sources')
+        )
+        doc_ref = sources_ref.document()
+        doc_ref.set(payload)
+        return jsonify({
+            'success': True,
+            'source_id': doc_ref.id,
+            'message': 'Source added',
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in demo-add-source: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/demo-delete-sources', methods=['POST'])
+@require_solari_key
+def demo_delete_sources():
+    """
+    Delete all source documents from an agent.
+    Deletes every document in teams/{team_id}/agents/{agent_id}/sources.
+
+    Request body:
+        team_id (required), agent_id (required).
+    """
+    try:
+        data = request.get_json() or {}
+        team_id = data.get('team_id')
+        agent_id = data.get('agent_id')
+        if not team_id or not agent_id:
+            return jsonify({'success': False, 'error': 'team_id and agent_id are required'}), 400
+
+        db = firestore.client()
+        sources_ref = (
+            db.collection('teams').document(team_id)
+            .collection('agents').document(agent_id)
+            .collection('sources')
+        )
+        deleted = 0
+        for doc in sources_ref.stream():
+            try:
+                doc.reference.delete()
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete source {doc.id}: {e}")
+        return jsonify({
+            'success': True,
+            'deleted': deleted,
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in demo-delete-sources: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# WORKFLOW STUFF 
+@app.route('/api/workflow/get-agent', methods=['POST'])
+@require_solari_key
+def get_agent():
+    """
+    Fetch agent document and its active workflow version config.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({
+                "success": False,
+                "error": "agent_not_found"
+            }), 404
+
+        agent_data = agent_snap.to_dict()
+        active_version_id = agent_data.get("activeVersionId")
+
+        # use requested version_id if provided, otherwise fall back to active
+        requested_version_id = data.get("version_id") or data.get("versionId")
+        version_id_to_fetch = requested_version_id or active_version_id
+
+        workflow_config = None
+        if version_id_to_fetch:
+            version_snap = (
+                agent_ref.collection("versions")
+                         .document(version_id_to_fetch)
+                         .get()
+            )
+            if version_snap.exists:
+                version_data = version_snap.to_dict()
+                workflow_config = {
+                    "versionId": version_snap.id,
+                    "label": version_data.get("label"),
+                    "createdAt": version_data.get("createdAt"),
+                    "nodes": version_data.get("nodes", []),
+                    "edges": version_data.get("edges", []),
+                }
+
+        return jsonify({
+            "success": True,
+            "agent": agent_data,
+            "workflowConfig": workflow_config  # None if no version saved yet
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_agent: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+
+VALID_TRIGGERS = {"ui", "slack", "webhook", "email"}
+
+@app.route('/api/workflow/trigger', methods=['POST'])
+@require_solari_key
+def update_workflow_trigger():
+    """
+    Update the trigger setting for an agent/workflow.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "trigger": "ui" | "slack" | "webhook" | "email"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        trigger = data.get("trigger")
+
+        if not user_id or not agent_id or not trigger:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, trigger"
+            }), 400
+
+        if trigger not in VALID_TRIGGERS:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid trigger. Must be one of: {', '.join(sorted(VALID_TRIGGERS))}"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        if not agent_ref.get().exists:
+            return jsonify({
+                "success": False,
+                "error": "agent_not_found"
+            }), 404
+
+        agent_ref.update({"trigger": trigger})
+
+        return jsonify({
+            "success": True,
+            "agent_id": agent_id,
+            "trigger": trigger
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in update_workflow_trigger: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+def compute_workflow_hash(nodes: list, edges: list) -> str:
+    # sort by id so order doesn't affect the hash
+    canonical = {
+        "nodes": sorted(nodes, key=lambda n: n["id"]),
+        "edges": sorted(edges, key=lambda e: e["id"]),
+    }
+    serialized = json.dumps(canonical, sort_keys=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+class SaveVersionRequest(BaseModel):
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    saved_by: str  # user id
+
+
+@app.route('/api/workflow/list-versions', methods=['POST'])
+@require_solari_key
+def list_agent_versions():
+    """
+    List all versions for an agent, returning version name and createdAt.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        if not agent_ref.get().exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        version_docs = agent_ref.collection("versions").stream()
+        versions = []
+        for doc in version_docs:
+            d = doc.to_dict()
+            versions.append({
+                "versionId": doc.id,
+                "label": d.get("label"),
+                "createdAt": d.get("createdAt"),
+            })
+
+        return jsonify({
+            "success": True,
+            "versions": versions,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in list_agent_versions: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/workflow/save-version", methods=['POST'])
+@require_solari_key
+def save_version_draft():
+    """
+    Save a new version of an agent's workflow if nodes/edges changed.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "nodes": [...],
+        "edges": [...]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        logger.info(f"[save_version_draft] raw payload keys: {list(data.keys())}")
+
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        nodes = data.get("nodes")
+        edges = data.get("edges")
+
+        logger.info(f"[save_version_draft] user_id={user_id!r} agent_id={agent_id!r} nodes_type={type(nodes).__name__} edges_type={type(edges).__name__}")
+
+        if not user_id or not agent_id:
+            logger.warning(f"[save_version_draft] missing user_id or agent_id")
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            logger.warning(f"[save_version_draft] nodes/edges wrong type: nodes={type(nodes).__name__} edges={type(edges).__name__}")
+            return jsonify({
+                "success": False,
+                "error": "nodes and edges must be lists"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+            logger.info(f"[save_version_draft] resolved team_id={team_id!r}")
+        except KeyError as e:
+            logger.warning(f"[save_version_draft] get_team_id_for_uid failed: {e}")
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({
+                "success": False,
+                "error": "agent_not_found"
+            }), 404
+
+        agent_data = agent_snap.to_dict()
+        incoming_hash = compute_workflow_hash(nodes, edges)
+
+        if agent_data.get("lastVersionHash") == incoming_hash:
+            return jsonify({
+                "success": True,
+                "versionId": None,
+                "label": None,
+                "changed": False,
+            }), 200
+
+        new_count = (agent_data.get("versionCount") or 0) + 1
+        version_ref = agent_ref.collection("versions").document()
+
+        batch = db.batch()
+        batch.set(version_ref, {
+            "label": f"v{new_count}",
+            "hash": incoming_hash,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "savedBy": user_id,
+            "nodes": nodes,
+            "edges": edges,
+        })
+        batch.update(agent_ref, {
+            "versionCount": new_count,
+            "activeVersionId": version_ref.id,  
+            "lastVersionHash": incoming_hash,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        batch.commit()
+
+        return jsonify({
+            "success": True,
+            "versionId": version_ref.id,
+            "label": f"v{new_count}",
+            "changed": True,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in save_version_draft: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# WORKFLOW FOR REVIEW WORK: 
+@app.route('/api/workflow/for-review/add', methods=['POST'])
+@require_solari_key
+def add_for_review():
+    """
+    Save a node's output to the team's global for-review subcollection.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "node_id": "n3",
+        "node_label": "Check Sentiment",
+        "input": "the raw input passed to the node",
+        "output": "the node's output / result",
+        "notes": "optional reviewer notes"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        node_id = data.get("node_id") or data.get("nodeId")
+        node_label = data.get("node_label") or data.get("nodeLabel")
+        input_data = data.get("input")
+        output_data = data.get("output")
+        notes = data.get("notes")
+
+        if not user_id or not agent_id or not node_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, node_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        # verify agent exists
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        if not agent_ref.get().exists:
+            return jsonify({
+                "success": False,
+                "error": "agent_not_found"
+            }), 404
+
+        # save to global for-review subcollection on the team
+        review_ref = (
+            db.collection("teams").document(team_id)
+              .collection("forReview").document()
+        )
+        review_ref.set({
+            "agentId": agent_id,
+            "nodeId": node_id,
+            "nodeLabel": node_label,
+            "input": input_data,
+            "output": output_data,
+            "notes": notes,
+            "status": "pending",        # pending | reviewed | dismissed
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "createdBy": user_id,
+        })
+
+        return jsonify({
+            "success": True,
+            "reviewId": review_ref.id,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in add_for_review: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/workflow/for-review/list', methods=['POST'])
+@require_solari_key
+def get_for_review():
+    """
+    Fetch all for-review items for a team, optionally filtered by agent or status.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",     (optional - filter by agent)
+        "status": "pending"          (optional - "pending" | "reviewed" | "dismissed")
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        status = data.get("status")
+
+        if not user_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameter: user_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        review_ref = (
+            db.collection("teams").document(team_id)
+              .collection("forReview")
+        )
+
+        # apply optional filters
+        query = review_ref
+        if agent_id:
+            query = query.where("agentId", "==", agent_id)
+        if status:
+            query = query.where("status", "==", status)
+
+        query = query.order_by("createdAt", direction=firestore.Query.DESCENDING)
+
+        items = []
+        for doc in query.stream():
+            item = doc.to_dict()
+            item["reviewId"] = doc.id
+            # convert timestamps for json serialization
+            if "createdAt" in item and item["createdAt"]:
+                item["createdAt"] = item["createdAt"].isoformat()
+            items.append(item)
+
+        return jsonify({
+            "success": True,
+            "items": items,
+            "count": len(items),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_for_review: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/workflow/for-review/update', methods=['POST'])
+@require_solari_key
+def update_for_review():
+    """
+    Update the status of a for-review item.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "review_id": "review_doc_id",
+        "status": "reviewed" | "dismissed"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        review_id = data.get("review_id") or data.get("reviewId")
+        status = data.get("status")
+
+        VALID_STATUSES = {"pending", "reviewed", "dismissed"}
+
+        if not user_id or not review_id or not status:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, review_id, status"
+            }), 400
+
+        if status not in VALID_STATUSES:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid status. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+
+        review_ref = (
+            db.collection("teams").document(team_id)
+              .collection("forReview").document(review_id)
+        )
+        if not review_ref.get().exists:
+            return jsonify({
+                "success": False,
+                "error": "review_item_not_found"
+            }), 404
+
+        review_ref.update({
+            "status": status,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "updatedBy": user_id,
+        })
+
+        return jsonify({
+            "success": True,
+            "reviewId": review_id,
+            "status": status,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in update_for_review: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+# NODE CRUD STUFF
+@app.route('/api/workflow/node/get', methods=['POST'])
+@require_solari_key
+def get_node_data():
+    """
+    Fetch a single node's data from the active workflow version.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "node_id": "n2"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        node_id = data.get("node_id") or data.get("nodeId")
+
+        if not user_id or not agent_id or not node_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, node_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        active_version_id = agent_snap.to_dict().get("activeVersionId")
+        if not active_version_id:
+            return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_snap = (
+            agent_ref.collection("versions")
+                     .document(active_version_id)
+                     .get()
+        )
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        nodes = version_snap.to_dict().get("nodes", [])
+        node = next((n for n in nodes if n.get("id") == node_id), None)
+
+        if not node:
+            return jsonify({"success": False, "error": "node_not_found"}), 404
+
+        return jsonify({
+            "success": True,
+            "node_id": node_id,
+            "kind": node.get("data", {}).get("kind"),
+            "data": node.get("data", {}),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_node_data: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/node/update', methods=['POST'])
+@require_solari_key
+def update_node_data():
+    """
+    Update a single node's data fields in the active workflow version.
+    Only the fields provided in the request body are updated (merge behavior).
+    Unknown fields are allowed to support future node types.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "node_id": "n2",
+        "data": {
+            "label": "My LLM Node",
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "systemPrompt": "You are a helpful assistant",
+            "userPrompt": "{{input.text}}"
+            // any fields — shape is open per node type
+        }
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        logger.info(f"[update_node_data] raw payload keys: {list(data.keys())}")
+
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        node_id = data.get("node_id") or data.get("nodeId")
+        node_data = data.get("data")
+
+        logger.info(f"[update_node_data] user_id={user_id!r} agent_id={agent_id!r} node_id={node_id!r} node_data_type={type(node_data).__name__}")
+
+        if not user_id or not agent_id or not node_id:
+            logger.warning(f"[update_node_data] missing required fields: user_id={user_id!r} agent_id={agent_id!r} node_id={node_id!r}")
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, node_id"
+            }), 400
+
+        if not isinstance(node_data, dict):
+            logger.warning(f"[update_node_data] node_data wrong type: {type(node_data).__name__}")
+            return jsonify({
+                "success": False,
+                "error": "data must be an object"
+            }), 400
+
+        # strip kind so the full node object can be sent without mutating structural metadata
+        node_data.pop("kind", None)
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+            logger.info(f"[update_node_data] resolved team_id={team_id!r}")
+        except KeyError as e:
+            logger.warning(f"[update_node_data] get_team_id_for_uid failed: {e}")
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            logger.warning(f"[update_node_data] agent not found: {agent_id!r}")
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        active_version_id = agent_snap.to_dict().get("activeVersionId")
+        logger.info(f"[update_node_data] active_version_id={active_version_id!r}")
+        if not active_version_id:
+            logger.warning(f"[update_node_data] no activeVersionId on agent {agent_id!r}")
+            return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_ref = agent_ref.collection("versions").document(active_version_id)
+        version_snap = version_ref.get()
+        if not version_snap.exists:
+            logger.warning(f"[update_node_data] version doc not found: {active_version_id!r}")
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        nodes = version_snap.to_dict().get("nodes", [])
+        logger.info(f"[update_node_data] version has {len(nodes)} nodes, looking for node_id={node_id!r}")
+
+        # find and patch the target node
+        node_found = False
+        updated_nodes = []
+        for node in nodes:
+            if node.get("id") == node_id:
+                node_found = True
+                # merge incoming data fields into existing node data
+                merged_data = {**node.get("data", {}), **node_data}
+                updated_nodes.append({**node, "data": merged_data})
+            else:
+                updated_nodes.append(node)
+
+        if not node_found:
+            return jsonify({"success": False, "error": "node_not_found"}), 404
+
+        version_ref.update({
+            "nodes": updated_nodes,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "node_id": node_id,
+            "data": next(n["data"] for n in updated_nodes if n["id"] == node_id),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in update_node_data: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/workflow/node/delete', methods=['POST'])
+@require_solari_key
+def delete_node():
+    """
+    Delete a node (and its connected edges) from the active workflow version.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "node_id": "n9"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        node_id = data.get("node_id") or data.get("nodeId")
+
+        if not user_id or not agent_id or not node_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, node_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        active_version_id = agent_snap.to_dict().get("activeVersionId")
+        if not active_version_id:
+            return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_ref = agent_ref.collection("versions").document(active_version_id)
+        version_snap = version_ref.get()
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        version_data = version_snap.to_dict()
+        nodes = version_data.get("nodes", [])
+        edges = version_data.get("edges", [])
+
+        if not any(n.get("id") == node_id for n in nodes):
+            return jsonify({"success": False, "error": "node_not_found"}), 404
+
+        # remove the node and any edges connected to it
+        updated_nodes = [n for n in nodes if n.get("id") != node_id]
+        updated_edges = [
+            e for e in edges
+            if e.get("source") != node_id and e.get("target") != node_id
+        ]
+
+        version_ref.update({
+            "nodes": updated_nodes,
+            "edges": updated_edges,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "node_id": node_id,
+            "edges_removed": len(edges) - len(updated_edges),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in delete_node: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/workflow/run/input-variables', methods=['POST'])
+@require_solari_key
+def get_input_variables():
+    """
+    Get all input variables defined across nodes in the active workflow version.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id"
+    }
+
+    Returns all nodes that have inputVariable and inputVariableType set.
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        active_version_id = agent_snap.to_dict().get("activeVersionId")
+        if not active_version_id:
+            return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_snap = (
+            agent_ref.collection("versions")
+                     .document(active_version_id)
+                     .get()
+        )
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        nodes = version_snap.to_dict().get("nodes", [])
+
+        # collect all nodes that have inputVariable defined
+        input_variables = []
+        for node in nodes:
+            node_data = node.get("data", {})
+            input_var = node_data.get("inputVariableName")
+            input_var_type = node_data.get("inputVariableType")  # e.g. "text" | "file"
+
+            if input_var:
+                input_variables.append({
+                    "nodeId": node.get("id"),
+                    "nodeLabel": node_data.get("label"),
+                    "nodeKind": node_data.get("kind"),
+                    "inputVariableName": input_var,
+                    "inputVariableType": input_var_type or "text",  # default to text
+                })
+
+        return jsonify({
+            "success": True,
+            "agentId": agent_id,
+            "versionId": active_version_id,
+            "inputVariables": input_variables,
+            "count": len(input_variables),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_input_variables: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/variable-values', methods=['POST'])
+@require_solari_key
+def get_run_variable_values():
+    """
+    Get the values of all variables set during a specific run.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_snap = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+              .get()
+        )
+
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+
+        # convert timestamps for json serialization
+        for key in ["startedAt", "completedAt"]:
+            if run_data.get(key):
+                run_data[key] = run_data[key].isoformat()
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "agentId": agent_id,
+            "versionId": run_data.get("versionId"),
+            "status": run_data.get("status"),
+            "startedAt": run_data.get("startedAt"),
+            "completedAt": run_data.get("completedAt"),
+            "variables": run_data.get("variables", {}),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_run_variable_values: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/workflow/run/analytics', methods=['POST'])
+@require_solari_key
+def workflow_run_analytics():
+    """
+    Return all run documents for an agent.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        if not agent_ref.get().exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        run_docs = agent_ref.collection("runs").stream()
+        runs = []
+        for doc in run_docs:
+            runs.append({"runId": doc.id, **doc.to_dict()})
+
+        return jsonify({
+            "success": True,
+            "agentId": agent_id,
+            "totalRuns": len(runs),
+            "runs": runs,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in workflow_run_analytics: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/create', methods=['POST'])
+@require_solari_key
+def create_run():
+    """
+    Validate input variables, create run doc and set status to running.
+    
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "input_variables": {
+            "file_test": "Q4 earnings call...",
+            "input2": "some text"
+            // any key/value pairs
+        }
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        input_variables = data.get("input_variables") or data.get("inputVariables") or {}
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        if not isinstance(input_variables, dict):
+            return jsonify({
+                "success": False,
+                "error": "input_variables must be an object"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        agent_data = agent_snap.to_dict()
+        active_version_id = agent_data.get("activeVersionId")
+        if not active_version_id:
+            return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        # fetch version to get required input variables
+        version_snap = (
+            agent_ref.collection("versions")
+                     .document(active_version_id)
+                     .get()
+        )
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        nodes = version_snap.to_dict().get("nodes", [])
+
+        # validate all required input variables have non-null values
+        missing = []
+        for node in nodes:
+            node_data = node.get("data", {})
+            if not node_data.get("requiresInputVariable"):
+                continue
+            var_name = node_data.get("inputVariableName")
+            if not var_name:
+                continue
+            value = input_variables.get(var_name)
+            if value is None or value == "":
+                missing.append({
+                    "nodeId": node.get("id"),
+                    "nodeLabel": node_data.get("label"),
+                    "inputVariableName": var_name,
+                    "inputVariableType": node_data.get("inputVariableType", "text"),
+                })
+
+        if missing:
+            return jsonify({
+                "success": False,
+                "error": "missing_input_variables",
+                "missing": missing
+            }), 400
+
+        # all valid — create run doc as running
+        run_ref = agent_ref.collection("runs").document()
+        version_label = f"v{agent_data.get('versionCount', 1)}"
+        run_ref.set({
+            "teamId": team_id,
+            "agentId": agent_id,
+            "agentName": agent_data.get("name"),
+            "versionId": active_version_id,
+            "versionLabel": version_label,
+            "status": "queued",
+            "triggeredBy": user_id,
+            "triggerSource": "frontend",
+            "startedAt": firestore.SERVER_TIMESTAMP,
+            "completedAt": None,
+            "inputVariables": input_variables,
+            "outputVariables": {},
+            "variables": input_variables.copy(),
+        })
+
+        return jsonify({
+            "success": True,
+            "runId": run_ref.id,
+            "teamId": team_id,
+            "agentId": agent_id,
+            "versionId": active_version_id,
+            "versionLabel": version_label,
+            "status": "queued",
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in create_run: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# WORKFLOW RUN STUFF
+
+# update node data in the run
+@app.route('/api/workflow/run/node-feedback', methods=['POST'])
+@require_solari_key
+def update_node_feedback():
+    """
+    Add or update a feedback object on a node execution entry within a run.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id",
+        "node_id": "n2",
+        "feedback": {
+            "rating": "thumbs_up",
+            "comment": "Great output"
+        }
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+        node_id = data.get("node_id") or data.get("nodeId")
+        feedback = data.get("feedback")
+
+        if not user_id or not agent_id or not run_id or not node_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id, node_id"
+            }), 400
+
+        if not isinstance(feedback, dict):
+            return jsonify({
+                "success": False,
+                "error": "feedback must be an object"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        if not agent_ref.get().exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        run_ref = agent_ref.collection("runs").document(run_id)
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        node_executions = run_snap.to_dict().get("nodeExecutions", [])
+
+        node_found = False
+        updated_executions = []
+        for entry in node_executions:
+            if entry.get("nodeId") == node_id:
+                node_found = True
+                updated_executions.append({**entry, "feedback": feedback})
+            else:
+                updated_executions.append(entry)
+
+        if not node_found:
+            return jsonify({"success": False, "error": "node_execution_not_found"}), 404
+
+        run_ref.update({
+            "nodeExecutions": updated_executions,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "nodeId": node_id,
+            "feedback": feedback,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in update_node_feedback: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/update-node-execution', methods=['POST'])
+@require_solari_key
+def update_node_execution():
+    """
+    Update the execution state of a single node within a run.
+    Called by the executor, demo runner, or debug tools.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id",
+        "node_execution": {
+            "nodeId": "n2",
+            "nodeLabel": "Summarise",
+            "kind": "llm",
+            "status": "completed",       // "running" | "completed" | "failed" | "skipped"
+            "startedAt": "ISO timestamp",
+            "completedAt": "ISO timestamp",
+            "output": "The key points are...",       // preview or full output if small
+            "outputRef": "gs://bucket/path/output.json",  // GCS ref if large
+            "outputVariable": "summary",
+            "error": null                // error message if status is failed
+        }
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+        node_execution = data.get("node_execution") or data.get("nodeExecution")
+
+        if not user_id or not agent_id or not run_id or not node_execution:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id, node_execution"
+            }), 400
+
+        if not isinstance(node_execution, dict):
+            return jsonify({
+                "success": False,
+                "error": "node_execution must be an object"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        run_ref = agent_ref.collection("runs").document(run_id)
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+
+        # build the updates
+        updates = {
+            "nodeExecutions": firestore.ArrayUnion([node_execution]),
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+
+        # if node completed and has an output variable, update variables map
+        output_variable = node_execution.get("outputVariable")
+        output = node_execution.get("output")
+        if (
+            node_execution.get("status") == "completed"
+            and output_variable
+            and output is not None
+        ):
+            updates[f"variables.{output_variable}"] = output
+            updates[f"outputVariables.{output_variable}"] = output
+
+        run_ref.update(updates)
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "nodeId": node_execution.get("nodeId"),
+            "status": node_execution.get("status"),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in update_node_execution: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/workflow/run/complete', methods=['POST'])
+@require_solari_key
+def complete_run():
+    """
+    Mark a run as completed.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        if not run_ref.get().exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_ref.update({
+            "status": "completed",
+            "completedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "status": "completed",
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in complete_run: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/fail', methods=['POST'])
+@require_solari_key
+def fail_run():
+    """
+    Mark a run as failed with a reason.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id",
+        "reason": "Node n3 failed: model API timeout"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+        reason = data.get("reason", "Unknown error")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        if not run_ref.get().exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_ref.update({
+            "status": "failed",
+            "failedAt": firestore.SERVER_TIMESTAMP,
+            "failureReason": reason,
+        })
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "status": "failed",
+            "reason": reason,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in fail_run: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/pause', methods=['POST'])
+@require_solari_key
+def pause_run():
+    """
+    Pause a run when it hits a forReview node.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id",
+        "paused_at_node_id": "n4",
+        "review_id": "r1"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+        paused_at_node_id = data.get("paused_at_node_id") or data.get("pausedAtNodeId")
+        review_id = data.get("review_id") or data.get("reviewId")
+
+        if not user_id or not agent_id or not run_id or not paused_at_node_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id, paused_at_node_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        if not run_ref.get().exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_ref.update({
+            "status": "paused",
+            "pausedAt": firestore.SERVER_TIMESTAMP,
+            "pausedAtNodeId": paused_at_node_id,
+            "blockedOn": {
+                "reason": "forReview",
+                "reviewId": review_id,
+            },
+        })
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "status": "paused",
+            "pausedAtNodeId": paused_at_node_id,
+            "reviewId": review_id,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in pause_run: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/resume', methods=['POST'])
+@require_solari_key
+def resume_run():
+    """
+    Resume a paused run after a review item is approved.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+        if run_data.get("status") != "paused":
+            return jsonify({
+                "success": False,
+                "error": f"Run is not paused, current status: {run_data.get('status')}"
+            }), 400
+
+        run_ref.update({
+            "status": "running",
+            "resumedAt": firestore.SERVER_TIMESTAMP,
+            "blockedOn": None,
+        })
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "status": "running",
+            "resumeFromNodeId": run_data.get("pausedAtNodeId"),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in resume_run: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/workflow/analytics/feedback', methods=['POST'])
+@require_solari_key
+def get_feedback_analytics():
+    """
+    Get aggregated feedback stats across all runs for an agent.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "limit": 30  // optional, default 30
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        limit = data.get("limit", 30)
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        runs_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs")
+              .order_by("startedAt", direction=firestore.Query.DESCENDING)
+              .limit(limit)
+        )
+        runs = runs_ref.stream()
+
+        # aggregate across all runs
+        total_runs = 0
+        runs_with_feedback = 0
+        total_thumbs_up = 0
+        total_thumbs_down = 0
+        per_run = []
+        per_node = {}  # nodeLabel -> { thumbsUp, thumbsDown }
+
+        for run in runs:
+            run_data = run.to_dict()
+            total_runs += 1
+            node_executions = run_data.get("nodeExecutions", [])
+
+            run_thumbs_up = 0
+            run_thumbs_down = 0
+            run_with_feedback = False
+
+            for node in node_executions:
+                rating = node.get("feedback", {}).get("rating")
+                if not rating:
+                    continue
+
+                run_with_feedback = True
+                node_label = node.get("nodeLabel", node.get("nodeId"))
+
+                if node_label not in per_node:
+                    per_node[node_label] = { "thumbsUp": 0, "thumbsDown": 0 }
+
+                if rating == "thumbs_up":
+                    run_thumbs_up += 1
+                    total_thumbs_up += 1
+                    per_node[node_label]["thumbsUp"] += 1
+                elif rating == "thumbs_down":
+                    run_thumbs_down += 1
+                    total_thumbs_down += 1
+                    per_node[node_label]["thumbsDown"] += 1
+
+            if run_with_feedback:
+                runs_with_feedback += 1
+
+            run_total = run_thumbs_up + run_thumbs_down
+            per_run.append({
+                "runId": run.id,
+                "startedAt": run_data.get("startedAt").isoformat() if run_data.get("startedAt") else None,
+                "thumbsUp": run_thumbs_up,
+                "thumbsDown": run_thumbs_down,
+                "total": run_total,
+                "score": round((run_thumbs_up / run_total) * 100) if run_total > 0 else None,
+            })
+
+        # overall score
+        total_feedback = total_thumbs_up + total_thumbs_down
+
+        # per node scores
+        per_node_scores = [
+            {
+                "nodeLabel": label,
+                "thumbsUp": stats["thumbsUp"],
+                "thumbsDown": stats["thumbsDown"],
+                "total": stats["thumbsUp"] + stats["thumbsDown"],
+                "score": round((stats["thumbsUp"] / (stats["thumbsUp"] + stats["thumbsDown"])) * 100)
+                         if (stats["thumbsUp"] + stats["thumbsDown"]) > 0 else None,
+            }
+            for label, stats in per_node.items()
+        ]
+
+        return jsonify({
+            "success": True,
+            "agentId": agent_id,
+            "totalRuns": total_runs,
+            "runsWithFeedback": runs_with_feedback,
+            "overall": {
+                "thumbsUp": total_thumbs_up,
+                "thumbsDown": total_thumbs_down,
+                "total": total_feedback,
+                "score": round((total_thumbs_up / total_feedback) * 100) if total_feedback > 0 else None,
+            },
+            "perRun": per_run,
+            "perNode": per_node_scores,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_feedback_analytics: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/status', methods=['POST'])
+@require_solari_key
+def get_run_status():
+    """
+    Lightweight polling endpoint for run status.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_snap = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+              .get()
+        )
+
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+
+        return jsonify({
+            "success": True,
+            "runId": run_id,
+            "status": run_data.get("status"),
+            "startedAt": run_data.get("startedAt").isoformat() if run_data.get("startedAt") else None,
+            "completedAt": run_data.get("completedAt").isoformat() if run_data.get("completedAt") else None,
+            "pausedAtNodeId": run_data.get("pausedAtNodeId"),
+            "blockedOn": run_data.get("blockedOn"),
+            "failureReason": run_data.get("failureReason"),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_run_status: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 if __name__ == '__main__':
     # Get port from environment or default to 5000

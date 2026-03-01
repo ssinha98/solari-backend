@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import re
 import requests
-from firebase_admin import firestore
+from firebase_config import db, firestore
 
 # ======================
 # ENV CONFIG
@@ -937,7 +937,6 @@ def process_job(db, job_ref):
 # ======================
 
 def main():
-    db = firestore.client()
     print(f"[worker] started as {WORKER_ID}")
 
     while True:
