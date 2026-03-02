@@ -4,8 +4,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# matches {{variable_name}} with optional whitespace inside braces
-VARIABLE_PATTERN = re.compile(r'\{\{\s*(\w+)\s*\}\}')
+# matches @variable_name references
+VARIABLE_PATTERN = re.compile(r'@(\w+)')
 
 
 def interpolate_string(text: str, variables: dict) -> str:

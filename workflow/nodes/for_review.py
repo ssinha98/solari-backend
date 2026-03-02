@@ -19,9 +19,10 @@ def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:
     notes = node_data.get("notes", "")
     node_id = node.get("id")
 
-    agent_id = run_data.get("agentId")
-    team_id = run_data.get("teamId")
-    run_id = run_ref.id
+    agent_id   = run_data.get("agentId")
+    agent_name = run_data.get("agentName")
+    team_id    = run_data.get("teamId")
+    run_id     = run_ref.id
 
     # get the input — output of the preceding node
     # last value written to variables before this node
@@ -36,9 +37,10 @@ def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:
               .collection("forReview").document()
         )
         review_ref.set({
-            "teamId": team_id,
-            "agentId": agent_id,
-            "runId": run_id,
+            "teamId":    team_id,
+            "agentId":   agent_id,
+            "agentName": agent_name,
+            "runId":     run_id,
             "nodeId": node_id,
             "nodeLabel": label,
             "input": input_text,

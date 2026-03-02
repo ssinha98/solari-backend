@@ -98,6 +98,11 @@ def execute_workflow(db, run_ref, run_data):
     """
     Main entry point. Fetches the workflow config, walks the graph,
     executes each node in sequence, and writes results to Firebase.
+
+    Supports three start modes:
+    - Normal: starts from the trigger node
+    - resumeAtNodeId: starts at a specific node (used for review resume — skips eval)
+    - resumeFromNodeId: starts at the node AFTER the specified node
     """
     agent_ref = run_ref.parent.parent
     version_id = run_data.get("versionId")
@@ -121,16 +126,40 @@ def execute_workflow(db, run_ref, run_data):
     # build lookup maps
     nodes_by_id, edges_by_source = build_lookup_maps(nodes, edges)
 
-    # find start node
-    current_node = find_trigger_node(nodes, edges)
+    # --- determine start node ---
+    resume_at_node_id   = run_data.get("resumeAtNodeId")
+    resume_from_node_id = run_data.get("resumeFromNodeId")
+
+    if resume_at_node_id:
+        # Start at this exact node — human review replaces the eval, jump to pass node
+        if resume_at_node_id not in nodes_by_id:
+            raise Exception(f"resumeAtNodeId {resume_at_node_id} not found in version")
+        current_node = nodes_by_id[resume_at_node_id]
+        run_ref.update({"resumeAtNodeId": firestore.DELETE_FIELD})
+        logger.info(f"Resuming workflow at node {resume_at_node_id}")
+
+    elif resume_from_node_id:
+        # Start from the node AFTER this one
+        outgoing = edges_by_source.get(resume_from_node_id, [])
+        if not outgoing:
+            raise Exception(f"No outgoing edges from resumeFromNodeId {resume_from_node_id}")
+        next_node_id = outgoing[0]["target"]
+        if next_node_id not in nodes_by_id:
+            raise Exception(f"resumeFromNodeId target {next_node_id} not found in version")
+        current_node = nodes_by_id[next_node_id]
+        run_ref.update({"resumeFromNodeId": firestore.DELETE_FIELD})
+        logger.info(f"Resuming workflow after node {resume_from_node_id} → starting at {current_node['id']}")
+
+    else:
+        # Normal start — find trigger node
+        current_node = find_trigger_node(nodes, edges)
+        logger.info(f"Starting workflow execution from trigger node: {current_node['id']}")
 
     # runtime variable map — starts with input variables
     variables = run_data.get("variables", {}).copy()
 
     # cycle protection
     visited = set()
-
-    logger.info(f"Starting workflow execution from trigger node: {current_node['id']}")
 
     while current_node:
         node_id = current_node["id"]

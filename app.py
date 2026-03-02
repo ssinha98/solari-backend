@@ -10756,6 +10756,7 @@ def add_for_review():
     {
         "user_id": "firebase_uid",
         "agent_id": "agent_id",
+        "run_id": "run_id",
         "node_id": "n3",
         "node_label": "Check Sentiment",
         "input": "the raw input passed to the node",
@@ -10767,6 +10768,7 @@ def add_for_review():
         data = request.get_json() or {}
         user_id = data.get("user_id") or data.get("userId")
         agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
         node_id = data.get("node_id") or data.get("nodeId")
         node_label = data.get("node_label") or data.get("nodeLabel")
         input_data = data.get("input")
@@ -10788,16 +10790,19 @@ def add_for_review():
                 "error": str(e)
             }), 404
 
-        # verify agent exists
+        # verify agent exists and grab name
         agent_ref = (
             db.collection("teams").document(team_id)
               .collection("agents").document(agent_id)
         )
-        if not agent_ref.get().exists:
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
             return jsonify({
                 "success": False,
                 "error": "agent_not_found"
             }), 404
+
+        agent_name = agent_snap.to_dict().get("name")
 
         # save to global for-review subcollection on the team
         review_ref = (
@@ -10805,13 +10810,15 @@ def add_for_review():
               .collection("forReview").document()
         )
         review_ref.set({
-            "agentId": agent_id,
-            "nodeId": node_id,
+            "agentId":   agent_id,
+            "agentName": agent_name,
+            "runId":     run_id,
+            "nodeId":    node_id,
             "nodeLabel": node_label,
-            "input": input_data,
-            "output": output_data,
-            "notes": notes,
-            "status": "pending",        # pending | reviewed | dismissed
+            "input":     input_data,
+            "output":    output_data,
+            "notes":     notes,
+            "status":    "pending",
             "createdAt": firestore.SERVER_TIMESTAMP,
             "createdBy": user_id,
         })
@@ -10829,16 +10836,113 @@ def add_for_review():
         }), 500
 
 
+@app.route('/api/workflow/for-review/get', methods=['POST'])
+@require_solari_key
+def get_for_review_item():
+    """
+    Fetch a single for-review item by ID, plus the previous node from the
+    run's nodeExecutions array (the node that produced the flagged content).
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "review_id": "review_doc_id"
+    }
+
+    Response:
+    {
+        "success": true,
+        "item": { ...review doc fields... },
+        "previousNode": { "nodeId", "nodeLabel", "kind", "output", "status" } | null,
+        "nextNode": null   // always null while paused — not yet executed
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id   = data.get("user_id")   or data.get("userId")
+        review_id = data.get("review_id") or data.get("reviewId")
+
+        if not user_id or not review_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, review_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        review_ref = (
+            db.collection("teams").document(team_id)
+              .collection("forReview").document(review_id)
+        )
+        review_snap = review_ref.get()
+        if not review_snap.exists:
+            return jsonify({"success": False, "error": "review_item_not_found"}), 404
+
+        item = review_snap.to_dict()
+        item["reviewId"] = review_snap.id
+
+        for ts_field in ("createdAt", "resolvedAt", "updatedAt"):
+            if item.get(ts_field):
+                item[ts_field] = item[ts_field].isoformat()
+
+        # --- fetch previous node from the run's nodeExecutions ---
+        previous_node = None
+        agent_id = item.get("agentId")
+        run_id   = item.get("runId")
+        for_review_node_id = item.get("nodeId")
+
+        agent_name = None
+        if agent_id and run_id and for_review_node_id:
+            run_snap = (
+                db.collection("teams").document(team_id)
+                  .collection("agents").document(agent_id)
+                  .collection("runs").document(run_id)
+                  .get()
+            )
+            if run_snap.exists:
+                run_data = run_snap.to_dict()
+                agent_name = run_data.get("agentName")
+                node_executions = run_data.get("nodeExecutions", [])
+                for idx, execution in enumerate(node_executions):
+                    if execution.get("nodeId") == for_review_node_id and idx > 0:
+                        prev = node_executions[idx - 1]
+                        previous_node = {
+                            "nodeId":    prev.get("nodeId"),
+                            "nodeLabel": prev.get("nodeLabel"),
+                            "kind":      prev.get("kind"),
+                            "output":    prev.get("output"),
+                            "status":    prev.get("status"),
+                        }
+                        break
+
+        return jsonify({
+            "success":      True,
+            "item":         item,
+            "agentName":    agent_name,
+            "previousNode": previous_node,
+            "nextNode":     None,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_for_review_item: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/workflow/for-review/list', methods=['POST'])
 @require_solari_key
 def get_for_review():
     """
-    Fetch all for-review items for a team, optionally filtered by agent or status.
+    Fetch all for-review items for a team, optionally filtered by agent, run, or status.
 
     Request Body:
     {
         "user_id": "firebase_uid",
         "agent_id": "agent_id",     (optional - filter by agent)
+        "run_id": "run_id",          (optional - filter by run)
         "status": "pending"          (optional - "pending" | "reviewed" | "dismissed")
     }
     """
@@ -10846,6 +10950,7 @@ def get_for_review():
         data = request.get_json() or {}
         user_id = data.get("user_id") or data.get("userId")
         agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
         status = data.get("status")
 
         if not user_id:
@@ -10872,6 +10977,8 @@ def get_for_review():
         query = review_ref
         if agent_id:
             query = query.where("agentId", "==", agent_id)
+        if run_id:
+            query = query.where("runId", "==", run_id)
         if status:
             query = query.where("status", "==", status)
 
@@ -10900,7 +11007,98 @@ def get_for_review():
         }), 500
 
 
-@app.route('/api/workflow/for-review/update', methods=['POST'])
+@app.route('/api/workflow/for-review/delete', methods=['POST'])
+@require_solari_key
+def delete_for_review():
+    """
+    Delete one or more for-review items from the team's forReview subcollection.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "review_ids": ["review_doc_id_1", "review_doc_id_2"]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id    = data.get("user_id")    or data.get("userId")
+        review_ids = data.get("review_ids") or data.get("reviewIds") or []
+
+        if not user_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameter: user_id"
+            }), 400
+
+        if not isinstance(review_ids, list):
+            return jsonify({
+                "success": False,
+                "error": "review_ids must be an array"
+            }), 400
+
+        if not review_ids:
+            return jsonify({
+                "success": True,
+                "deleted": [],
+                "deletedCount": 0,
+            }), 200
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        review_coll = (
+            db.collection("teams").document(team_id)
+              .collection("forReview")
+        )
+
+        failure_reason = "failed - user deleted task for review"
+        now = firestore.SERVER_TIMESTAMP
+
+        deleted = []
+        for review_id in review_ids:
+            if not review_id:
+                continue
+            ref = review_coll.document(review_id)
+            snap = ref.get()
+            if snap.exists:
+                review_data = snap.to_dict()
+                run_id   = review_data.get("runId")
+                agent_id = review_data.get("agentId")
+                ref.delete()
+                deleted.append(review_id)
+
+                # mark the run as failed so we can keep track
+                if run_id and agent_id:
+                    run_ref = (
+                        db.collection("teams").document(team_id)
+                          .collection("agents").document(agent_id)
+                          .collection("runs").document(run_id)
+                    )
+                    run_ref.update({
+                        "status":         "failed",
+                        "failureReason": failure_reason,
+                        "completedAt":   now,
+                        "blockedOn":     firestore.DELETE_FIELD,
+                        "pausedAtNodeId": firestore.DELETE_FIELD,
+                        "pausedAt":      firestore.DELETE_FIELD,
+                        "lockedBy":      None,
+                    })
+
+        return jsonify({
+            "success":     True,
+            "deleted":     deleted,
+            "deletedCount": len(deleted),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in delete_for_review: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/for-review/update_status', methods=['POST'])
 @require_solari_key
 def update_for_review():
     """
@@ -10970,6 +11168,325 @@ def update_for_review():
             "success": False,
             "error": str(e)
         }), 500
+
+# ---------------------------------------------------------------------------
+# POST /api/workflow/for-review/resume
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# POST /api/workflow/for-review/resume
+# ---------------------------------------------------------------------------
+@app.route('/api/workflow/for-review/resume', methods=['POST'])
+@require_solari_key
+def resume_from_review():
+    """
+    Resume a paused run from the eval's pass node. The human review replaces
+    the eval — we skip it entirely and jump straight to the pass path.
+    updated_input is optional; if omitted, the original input is used as-is.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "review_id": "review_doc_id",
+        "updated_input": "corrected value from reviewer"  // optional
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id       = data.get("user_id")       or data.get("userId")
+        review_id     = data.get("review_id")     or data.get("reviewId")
+        updated_input = data.get("updated_input") or data.get("updatedInput")  # optional
+
+        if not user_id or not review_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, review_id"
+            }), 400
+
+        db = firestore.client()
+
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        # --- load forReview doc ---
+        review_ref = (
+            db.collection("teams").document(team_id)
+              .collection("forReview").document(review_id)
+        )
+        review_snap = review_ref.get()
+        if not review_snap.exists:
+            return jsonify({"success": False, "error": "review_item_not_found"}), 404
+
+        review_data = review_snap.to_dict()
+
+        if review_data.get("status") != "pending":
+            return jsonify({
+                "success": False,
+                "error": f"Review item is not pending (status: {review_data.get('status')})"
+            }), 409
+
+        run_id   = review_data.get("runId")
+        agent_id = review_data.get("agentId")
+
+        # --- load run doc ---
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+
+        if run_data.get("status") != "paused":
+            return jsonify({
+                "success": False,
+                "error": f"Run is not paused (status: {run_data.get('status')})"
+            }), 409
+
+        # --- load agent version to find the eval node's pass path ---
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        version_id = run_data.get("versionId")
+        version_snap = (
+            agent_ref.collection("versions").document(version_id).get()
+        )
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "agent_version_not_found"}), 404
+
+        version_data = version_snap.to_dict()
+        nodes = version_data.get("nodes", [])
+
+        # find the eval node that routes to the forReview node on fail
+        for_review_node_id = review_data.get("nodeId")  # e.g. "n6"
+        eval_node = next(
+            (n for n in nodes if n.get("data", {}).get("evalFailNodeId") == for_review_node_id),
+            None
+        )
+        if not eval_node:
+            return jsonify({
+                "success": False,
+                "error": f"Could not find eval node routing to forReview node {for_review_node_id}"
+            }), 400
+
+        eval_pass_node_id = eval_node.get("data", {}).get("evalPassNodeId")
+        if not eval_pass_node_id:
+            return jsonify({
+                "success": False,
+                "error": "Eval node has no evalPassNodeId"
+            }), 400
+
+        # --- patch variables with reviewer's value (or original if unchanged) ---
+        original_input   = review_data.get("input")
+        effective_input  = updated_input if updated_input is not None else original_input
+        variables        = run_data.get("variables", {}).copy()
+        output_variables = run_data.get("outputVariables", {}).copy()
+
+        for k, v in variables.items():
+            if v == original_input:
+                variables[k]        = effective_input
+                output_variables[k] = effective_input
+
+        now = firestore.SERVER_TIMESTAMP
+
+        # --- update forReview doc ---
+        review_ref.update({
+            "originalInput": original_input,
+            "updatedInput":  effective_input,
+            "input":         effective_input,
+            "status":        "resolved",
+            "resolvedAt":    now,
+            "resolvedBy":    user_id,
+        })
+
+        # --- update run doc: patch variables, set resumeAtNodeId, re-queue ---
+        run_ref.update({
+            "status":          "queued",
+            "resumeAtNodeId":  eval_pass_node_id,  # e.g. "n5" — skip eval entirely
+            "variables":       variables,
+            "outputVariables": output_variables,
+            "blockedOn":       firestore.DELETE_FIELD,
+            "pausedAtNodeId":  firestore.DELETE_FIELD,
+            "pausedAt":        firestore.DELETE_FIELD,
+            "updatedAt":       now,
+        })
+
+        logger.info(
+            f"Run {run_id} resumed from review {review_id}. "
+            f"Skipping eval, resuming at pass node {eval_pass_node_id}."
+        )
+
+        return jsonify({
+            "success":        True,
+            "runId":          run_id,
+            "reviewId":       review_id,
+            "resumeAtNodeId": eval_pass_node_id,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in resume_from_review: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# POST /api/workflow/for-review/restart
+# ---------------------------------------------------------------------------
+@app.route('/api/workflow/for-review/restart', methods=['POST'])
+@require_solari_key
+def restart_from_review():
+    """
+    Mark the existing paused run as failed, then create a new run
+    using the same agent version and original input variables.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "review_id": "review_doc_id"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id   = data.get("user_id")   or data.get("userId")
+        review_id = data.get("review_id") or data.get("reviewId")
+
+        if not user_id or not review_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, review_id"
+            }), 400
+
+        db = firestore.client()
+
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        # --- load forReview doc ---
+        review_ref = (
+            db.collection("teams").document(team_id)
+              .collection("forReview").document(review_id)
+        )
+        review_snap = review_ref.get()
+        if not review_snap.exists:
+            return jsonify({"success": False, "error": "review_item_not_found"}), 404
+
+        review_data = review_snap.to_dict()
+
+        if review_data.get("status") != "pending":
+            return jsonify({
+                "success": False,
+                "error": f"Review item is not pending (status: {review_data.get('status')})"
+            }), 409
+
+        run_id     = review_data.get("runId")
+        agent_id   = review_data.get("agentId")
+        node_label = review_data.get("nodeLabel", review_data.get("nodeId", "unknown node"))
+
+        # --- load original run doc ---
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+
+        if run_data.get("status") != "paused":
+            return jsonify({
+                "success": False,
+                "error": f"Run is not paused (status: {run_data.get('status')})"
+            }), 409
+
+        # --- load agent doc for name ---
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        agent_data = agent_snap.to_dict()
+
+        input_variables = run_data.get("inputVariables", {})
+        now = firestore.SERVER_TIMESTAMP
+        failure_reason = f"failed on review at {node_label}"
+
+        # --- create new run ref (auto id) ---
+        new_run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document()
+        )
+
+        new_run_data = {
+            "teamId":          team_id,
+            "agentId":         agent_id,
+            "agentName":       agent_data.get("name"),
+            "versionId":       run_data.get("versionId"),
+            "versionLabel":    run_data.get("versionLabel"),
+            "status":          "queued",
+            "triggeredBy":     user_id,
+            "triggerSource":   "review_restart",
+            "startedAt":       now,
+            "completedAt":     None,
+            "inputVariables":  input_variables,
+            "outputVariables": {},
+            "variables":       input_variables.copy(),
+            # audit trail
+            "restartedFromRunId":    run_id,
+            "restartedFromReviewId": review_id,
+        }
+
+        # --- atomic batch: fail old run + resolve review + create new run ---
+        batch = db.batch()
+
+        batch.update(run_ref, {
+            "status":         "failed",
+            "failureReason":  failure_reason,
+            "completedAt":    now,
+            "updatedAt":      now,
+            "blockedOn":      firestore.DELETE_FIELD,
+            "pausedAtNodeId": firestore.DELETE_FIELD,
+            "pausedAt":       firestore.DELETE_FIELD,
+        })
+
+        batch.update(review_ref, {
+            "status":     "restarted",
+            "resolvedAt": now,
+            "resolvedBy": user_id,
+            "newRunId":   new_run_ref.id,
+        })
+
+        batch.set(new_run_ref, new_run_data)
+
+        batch.commit()
+
+        logger.info(
+            f"Run {run_id} failed on review at {node_label}. "
+            f"New run {new_run_ref.id} queued for agent {agent_id}."
+        )
+
+        return jsonify({
+            "success":  True,
+            "oldRunId": run_id,
+            "newRunId": new_run_ref.id,
+            "reviewId": review_id,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in restart_from_review: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 # NODE CRUD STUFF
 @app.route('/api/workflow/node/get', methods=['POST'])
@@ -12160,6 +12677,7 @@ def get_run_status():
             "completedAt": run_data.get("completedAt").isoformat() if run_data.get("completedAt") else None,
             "pausedAtNodeId": run_data.get("pausedAtNodeId"),
             "blockedOn": run_data.get("blockedOn"),
+            "failedAt": run_data.get("failedAt").isoformat() if run_data.get("failedAt") else None,
             "failureReason": run_data.get("failureReason"),
         }), 200
 

@@ -24,14 +24,15 @@ def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:
     output_variable = node_data.get("outputVariable")
     user_id = run_data.get("triggeredBy")
 
-    if not user_prompt:
-        raise Exception(f"LLM node '{label}' has no user prompt configured")
+    if not user_prompt and not system_prompt:
+        raise Exception(f"LLM node '{label}' has no prompt configured")
 
     # build messages
     messages = []
     if system_prompt:
         messages.append({ "role": "system", "content": system_prompt })
-    messages.append({ "role": "user", "content": user_prompt })
+    if user_prompt:
+        messages.append({ "role": "user", "content": user_prompt })
 
     logger.info(f"LLM node '{label}' calling model: {model}")
 
