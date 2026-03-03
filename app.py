@@ -3387,11 +3387,36 @@ def test_scrape():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _parse_openai_deep_research_response(response_data: dict) -> dict:
+    """
+    Parse OpenAI /v1/responses/{id} body into a single object: main_text plus annotations/urls.
+    Response has output[] with type "message", content[] with type "output_text", text, annotations.
+    """
+    main_text_parts = []
+    annotations = []
+    for item in response_data.get("output", []):
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") != "output_text":
+                continue
+            main_text_parts.append(content.get("text", ""))
+            annotations.extend(content.get("annotations", []))
+    main_text = "\n\n".join(main_text_parts).strip()
+    urls = sorted({a.get("url") for a in annotations if a.get("url")})
+    return {
+        "main_text": main_text,
+        "annotations": annotations,
+        "urls": urls,
+    }
+
+
 @app.route("/api/openai-deep-research-callback", methods=["POST"])
 def openai_deep_research_callback():
     """
-    Webhook for OpenAI o3-deep-research. Receives response.completed / response.failed,
-    finds the run by openaiResearchJob.threadId, then (in a later step) updates run and re-queues.
+    Webhook for OpenAI o3-deep-research. On response.completed: fetch response, parse,
+    update run (nodeExecutions, outputVariables), clear openaiResearchJob, re-queue.
+    On response.failed: mark run failed and clear openaiResearchJob.
     """
     try:
         webhook_secret = os.getenv("OPENAI_WEBHOOK_SECRET")
@@ -3439,12 +3464,70 @@ def openai_deep_research_callback():
             if job.get("threadId") != response_id:
                 continue
             run_ref = run.reference
-            logger.info("OpenAI webhook found run %s for response_id %s", run.id, response_id)
+            node_id = job.get("nodeId")
+            output_variable = job.get("outputVariable")
+
+            if event_type == "response.failed":
+                run_ref.update({
+                    "status": "failed",
+                    "failureReason": "OpenAI deep research job failed",
+                    "failedAt": firestore.SERVER_TIMESTAMP,
+                    "openaiResearchJob": firestore.DELETE_FIELD,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                })
+                logger.info("OpenAI webhook run %s marked failed (response.failed)", run.id)
+                return make_response("", 200)
+
+            if event_type != "response.completed":
+                logger.info("OpenAI webhook ignoring event_type=%s", event_type)
+                return make_response("", 200)
+
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                logger.error("OPENAI_API_KEY not set, cannot fetch response")
+                return make_response("OpenAI API key not set", 500)
+            url = f"https://api.openai.com/v1/responses/{response_id}"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            api_response = requests.get(url, headers=headers, timeout=60)
+            api_response.raise_for_status()
+            response_data = api_response.json()
+
+            output_object = _parse_openai_deep_research_response(response_data)
+
+            run_snap = run_ref.get()
+            run_data_fresh = run_snap.to_dict() or {}
+            executions = list(run_data_fresh.get("nodeExecutions") or [])
+            for i, ex in enumerate(executions):
+                if ex.get("nodeId") == node_id:
+                    executions[i] = {
+                        **ex,
+                        "output": output_object,
+                        "status": "completed",
+                        "completedAt": datetime.now(timezone.utc),
+                    }
+                    break
+
+            updates = {
+                "nodeExecutions": executions,
+                "openaiResearchJob": firestore.DELETE_FIELD,
+                "status": "queued",
+                "resumeFromNodeId": node_id,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+            if output_variable:
+                updates[f"variables.{output_variable}"] = output_object
+                updates[f"outputVariables.{output_variable}"] = output_object
+
+            run_ref.update(updates)
+            logger.info("OpenAI webhook run %s completed, re-queued from node %s", run.id, node_id)
             return make_response("", 200)
 
         logger.warning("OpenAI webhook no run found for response_id=%s", response_id)
         return make_response("", 404)
 
+    except requests.RequestException as e:
+        logger.exception("OpenAI webhook fetch response failed: %s", e)
+        return make_response("Failed to fetch OpenAI response", 502)
     except Exception as e:
         logger.exception("OpenAI webhook error: %s", e)
         return make_response("Webhook error", 500)
