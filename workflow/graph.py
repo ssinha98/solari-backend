@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timezone
 from firebase_config import firestore
 from workflow.interpolator import interpolate
-from workflow.nodes import llm, connector, eval_node, trigger, for_review, complete
+from workflow.nodes import llm, connector, eval_node, trigger, for_review, complete, email, website, deep_research
 # from workflow.nodes import llm, connector, eval_node, trigger, output, for_review, complete
 #
 logger = logging.getLogger(__name__)
@@ -16,6 +16,9 @@ NODE_EXECUTORS = {
     "eval":      eval_node.execute,
     "forReview": for_review.execute,
     "complete":   complete.execute,
+    "email":     email.execute,
+    "website":   website.execute,
+    "deepResearch": deep_research.execute,
 }
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -192,9 +195,14 @@ def execute_workflow(db, run_ref, run_data):
         # write node execution to Firebase
         write_node_execution(run_ref, current_node, result)
 
-        # handle pause (forReview node)
+        # handle pause (forReview, deepResearch, or other)
         if result.get("pause"):
-            logger.info(f"Run paused at node {node_id} for review")
+            if node_kind == "forReview":
+                logger.info(f"Run paused at node {node_id} for review")
+            elif node_kind == "deepResearch":
+                logger.info(f"Run paused at node {node_id} for deep research")
+            else:
+                logger.info(f"Run paused at node {node_id}")
             return
 
         # handle node failure

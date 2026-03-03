@@ -1,9 +1,11 @@
-
+import os
 import time
 import logging
 import socket
 from firebase_config import db, firestore, auth, storage
+from datetime import datetime, timezone
 from workflow.graph import execute_workflow
+from workflow.deep_research.perplexity import PerplexityAsyncClient
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -95,6 +97,127 @@ def poll_once(db):
     except Exception as e:
         logger.error(f"Poll error: {e}", exc_info=True)
 
+
+def poll_deep_research_once(db):
+    """
+    Find runs paused with deepResearchJob (Perplexity), check job status.
+    When COMPLETED: write node output, update variables, clear deepResearchJob, re-queue run.
+    When FAILED: mark run failed, clear deepResearchJob.
+    """
+    api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not api_key:
+        return
+
+    try:
+        runs = (
+            db.collection_group("runs")
+            .where("status", "==", "paused_deep_research")
+            .limit(20)
+            .stream()
+        )
+        for run in runs:
+            run_ref = run.reference
+            run_data = run.to_dict()
+            job = run_data.get("deepResearchJob")
+            if not job or job.get("provider") != "perplexity deep research":
+                continue
+
+            run_id = run.id
+            thread_id = job.get("threadId")
+            node_id = job.get("nodeId")
+            output_variable = job.get("outputVariable")
+            if not thread_id or not node_id:
+                logger.warning(f"Run {run_id} deepResearchJob missing threadId or nodeId, skipping")
+                continue
+
+            client = PerplexityAsyncClient(api_key=api_key)
+            try:
+                status_data = client.check_job_status(thread_id)
+            except Exception as e:
+                logger.warning(f"Run {run_id} check_job_status failed: {e}")
+                continue
+
+            status = status_data.get("status")
+
+            if status == "COMPLETED":
+                response = status_data.get("response", {})
+                content = (response.get("choices") or [{}])[0].get("message", {}) or {}
+                content = content.get("content", "") or ""
+
+                raw_citations = response.get("citations", [])
+                citations = []
+                for c in raw_citations:
+                    if isinstance(c, dict):
+                        citations.append({"title": c.get("title"), "url": c.get("url")})
+                    elif isinstance(c, str):
+                        citations.append({"title": None, "url": c})
+
+                citation_lines = [
+                    f"[{i + 1}] {c.get('url') or ''}" for i, c in enumerate(citations)
+                ]
+                full_response = content
+                if citation_lines:
+                    full_response = content.rstrip() + "\n\n" + "\n".join(citation_lines)
+
+                logger.info(f"Run {run_id} deep research full output:\n{full_response}")
+
+                agent_ref = run_ref.parent.parent
+                version_id = run_data.get("versionId")
+                version_snap = agent_ref.collection("versions").document(version_id).get()
+                if not version_snap.exists:
+                    logger.error(f"Run {run_id} version {version_id} not found")
+                    continue
+                version = version_snap.to_dict()
+                nodes = version.get("nodes", [])
+                node = next((n for n in nodes if n.get("id") == node_id), None)
+                if not node:
+                    logger.error(f"Run {run_id} node {node_id} not found in version")
+                    continue
+
+                # Update the existing node execution (written when node paused) with final output
+                run_snap = run_ref.get()
+                run_data_fresh = run_snap.to_dict() or {}
+                executions = list(run_data_fresh.get("nodeExecutions") or [])
+                for i, ex in enumerate(executions):
+                    if ex.get("nodeId") == node_id:
+                        executions[i] = {
+                            **ex,
+                            "output": full_response,
+                            "status": "completed",
+                            "completedAt": datetime.now(timezone.utc),
+                        }
+                        break
+                updates = {
+                    "nodeExecutions": executions,
+                    "deepResearchJob": firestore.DELETE_FIELD,
+                    "status": "queued",
+                    "resumeFromNodeId": node_id,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "citations": citations,
+                }
+                if output_variable:
+                    updates[f"variables.{output_variable}"] = full_response
+                    updates[f"outputVariables.{output_variable}"] = full_response
+
+                run_ref.update(updates)
+                logger.info(f"Run {run_id} deep research completed, re-queued from node {node_id}")
+
+            elif status == "FAILED":
+                error_msg = status_data.get("error_message", "Unknown error")
+                run_ref.update({
+                    "status": "failed",
+                    "failureReason": error_msg,
+                    "failedAt": firestore.SERVER_TIMESTAMP,
+                    "deepResearchJob": firestore.DELETE_FIELD,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                })
+                logger.info(f"Run {run_id} deep research failed: {error_msg}")
+            # else: still processing, next poll will check again
+
+    except Exception as e:
+        logger.error(f"Deep research poll error: {e}", exc_info=True)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -102,6 +225,7 @@ def main():
     logger.info("Firebase connected, polling for queued runs...")
 
     while True:
+        poll_deep_research_once(db)
         poll_once(db)
         time.sleep(POLL_INTERVAL_SECONDS)
 

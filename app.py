@@ -77,7 +77,6 @@ else:
     logger.warning("FIRECRAWL_API_KEY not set, Firecrawl features will be unavailable")
     firecrawl = None
 
-
 # Helper functions to load environment variables
 def get_env_var(key: str, default: str = None, required: bool = False) -> str:
     """
@@ -183,7 +182,7 @@ def add_cors_headers(response):
     response.headers['Access-Control-Max-Age'] = '86400'
     return response
 
-def send_email(to_email, subject, body, html_body=None):
+def send_email(to_email, subject, body, html_body=None, from_email=None):
     """Sends an email using Mailgun API"""
     mailgun_api_key = os.getenv('MAILGUN_API_KEY')
     if not mailgun_api_key:
@@ -191,7 +190,7 @@ def send_email(to_email, subject, body, html_body=None):
         return None
 
     payload = {
-        "from": "Sahil's Robots @ Solari <postmaster@robots.usesolari.ai>",
+        "from": from_email or "Sahil's Robots @ Solari <postmaster@robots.usesolari.ai>",
         "to": to_email,
         "subject": subject,
         "text": body,
@@ -3299,6 +3298,157 @@ def scrape_website_with_firecrawl(url: str) -> dict:
     except Exception as e:
         logger.error(f"Error scraping website with Firecrawl: {str(e)}")
         raise ValueError(f"Failed to scrape website: {str(e)}")
+
+
+def scrape_website_structured(url: str, prompt: str) -> dict:
+    """
+    Scrape a URL with Firecrawl using structured JSON extraction.
+    Uses a fixed schema: { "success": bool, "answer": str }.
+    Returns the raw Firecrawl response as a JSON-serializable dict.
+    """
+    if firecrawl is None:
+        raise ValueError("Firecrawl is not initialized. Please set FIRECRAWL_API_KEY environment variable.")
+    schema = {
+        "type": "object",
+        "properties": {
+            "success": {"type": "boolean"},
+            "answer": {"type": "string"}
+        },
+        "required": ["success", "answer"]
+    }
+    result = firecrawl.scrape(url, formats=[{
+        "type": "json",
+        "schema": schema,
+        "prompt": prompt,
+    }])
+    # Normalize to JSON-serializable dict. SDK may return full { success, data } or the data object directly.
+    def _to_json_dict(obj):
+        if obj is None or isinstance(obj, dict):
+            return obj
+        return getattr(obj, "__dict__", None) or {"answer": getattr(obj, "answer", None), "success": getattr(obj, "success", None)}
+
+    if isinstance(result, dict):
+        # If top-level has "data", ensure data.json is a dict
+        data = result.get("data")
+        if data is None:
+            # SDK returned data object as root
+            data = result
+        if isinstance(data, dict):
+            j = data.get("json")
+            if j is not None and not isinstance(j, dict):
+                data["json"] = _to_json_dict(j)
+        if result.get("data") is not None:
+            return result
+        return {"success": True, "data": data if isinstance(data, dict) else {"json": None, "metadata": None}}
+
+    data = getattr(result, "data", result)
+    if data is None:
+        return {"data": None}
+    json_val = data.get("json") if isinstance(data, dict) else getattr(data, "json", None)
+    metadata_val = data.get("metadata") if isinstance(data, dict) else getattr(data, "metadata", None)
+    return {
+        "data": {
+            "json": _to_json_dict(json_val),
+            "metadata": metadata_val if isinstance(metadata_val, dict) or metadata_val is None else _to_json_dict(metadata_val),
+        }
+    }
+
+
+@app.post("/api/test-scrape")
+@require_solari_key
+def test_scrape():
+    """
+    Test the structured Firecrawl scrape (same as website node).
+    Body: { "url": "https://example.com", "prompt": "What is this company's main product? Summarize in 2 sentences." }
+    Returns the full normalized response and the extracted answer.
+    """
+    body = request.get_json(force=True) or {}
+    url = (body.get("url") or "").strip()
+    prompt = (body.get("prompt") or "").strip()
+    if not url:
+        return jsonify({"success": False, "error": "url is required"}), 400
+    if not prompt:
+        return jsonify({"success": False, "error": "prompt is required"}), 400
+    try:
+        raw = scrape_website_structured(url=url, prompt=prompt)
+        data = raw.get("data") or {}
+        json_val = data.get("json") if isinstance(data, dict) else getattr(data, "json", None)
+        if isinstance(json_val, dict):
+            answer = json_val.get("answer")
+        else:
+            answer = getattr(json_val, "answer", None) if json_val is not None else None
+        return jsonify({
+            "success": True,
+            "raw": raw,
+            "answer": answer,
+        })
+    except Exception as e:
+        logger.exception("test_scrape failed")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/openai-deep-research-callback", methods=["POST"])
+def openai_deep_research_callback():
+    """
+    Webhook for OpenAI o3-deep-research. Receives response.completed / response.failed,
+    finds the run by openaiResearchJob.threadId, then (in a later step) updates run and re-queues.
+    """
+    try:
+        webhook_secret = os.getenv("OPENAI_WEBHOOK_SECRET")
+
+        if webhook_secret:
+            webhook_client = OpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                webhook_secret=webhook_secret,
+            )
+            try:
+                event = webhook_client.webhooks.unwrap(request.data, request.headers)
+            except Exception as e:
+                logger.warning("OpenAI webhook signature verification failed: %s", e)
+                return make_response("Invalid signature", 400)
+        else:
+            event = request.get_json()
+            if event is None:
+                return make_response("Invalid JSON", 400)
+
+        response_id = (
+            event.get("data", {}).get("id")
+            if isinstance(event, dict)
+            else getattr(getattr(event, "data", None), "id", None)
+        )
+        event_type = (
+            event.get("type")
+            if isinstance(event, dict)
+            else getattr(event, "type", None)
+        )
+
+        if not response_id:
+            logger.warning("OpenAI webhook missing data.id")
+            return make_response("Missing data.id", 400)
+
+        logger.info("OpenAI webhook event_type=%s response_id=%s", event_type, response_id)
+
+        runs = (
+            db.collection_group("runs")
+            .where("status", "==", "paused_openai_research")
+            .stream()
+        )
+        for run in runs:
+            run_data = run.to_dict()
+            job = run_data.get("openaiResearchJob") or {}
+            if job.get("threadId") != response_id:
+                continue
+            run_ref = run.reference
+            logger.info("OpenAI webhook found run %s for response_id %s", run.id, response_id)
+            return make_response("", 200)
+
+        logger.warning("OpenAI webhook no run found for response_id=%s", response_id)
+        return make_response("", 404)
+
+    except Exception as e:
+        logger.exception("OpenAI webhook error: %s", e)
+        return make_response("Webhook error", 500)
+
 
 @app.post("/api/website/add_urls")
 @require_solari_key
