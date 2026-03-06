@@ -1,30 +1,45 @@
+import re
 import logging
 from datetime import datetime, timezone
-from firebase_config import firestore
+from firebase_admin import firestore
 from workflow.interpolator import interpolate
-from workflow.nodes import llm, connector, eval_node, trigger, for_review, complete, email, website, deep_research
-# from workflow.nodes import llm, connector, eval_node, trigger, output, for_review, complete
-#
+from workflow.nodes import (
+    llm,
+    connector,
+    eval_node,
+    trigger,
+    complete,
+    for_review,
+    pipedrive,
+    email,
+    website,
+    deep_research,
+    apollo,
+    agentic_search,
+)
+
 logger = logging.getLogger(__name__)
 
 # ─── Node executor routing ────────────────────────────────────────────────────
 
 NODE_EXECUTORS = {
-    "trigger":   trigger.execute,
-    "llm":       llm.execute,
-    "connector": connector.execute,
-    "eval":      eval_node.execute,
-    "forReview": for_review.execute,
-    "complete":   complete.execute,
-    "email":     email.execute,
-    "website":   website.execute,
-    "deepResearch": deep_research.execute,
+    "trigger":       trigger.execute,
+    "llm":           llm.execute,
+    "connector":     connector.execute,
+    "eval":          eval_node.execute,
+    "complete":      complete.execute,
+    "forReview":     for_review.execute,
+    "pipedrive":     pipedrive.execute,
+    "email":         email.execute,
+    "website":       website.execute,
+    "deepResearch":  deep_research.execute,
+    "apolloEnrich":  apollo.execute,
+    "agenticSearch": agentic_search.execute,
 }
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def build_lookup_maps(nodes, edges):
-    """Build id-keyed maps for fast lookup during traversal."""
     nodes_by_id = { n["id"]: n for n in nodes }
     edges_by_source = {}
     for edge in edges:
@@ -33,7 +48,6 @@ def build_lookup_maps(nodes, edges):
 
 
 def find_trigger_node(nodes, edges):
-    """Find the start node — the one with no incoming edges."""
     target_ids = { e["target"] for e in edges }
     trigger_nodes = [n for n in nodes if n["id"] not in target_ids]
     if not trigger_nodes:
@@ -44,18 +58,13 @@ def find_trigger_node(nodes, edges):
 
 
 def pick_next_node(current_node, outgoing_edges, result, nodes_by_id):
-    """
-    Given the current node and its result, pick the next node to execute.
-    Handles branching for eval and condition nodes.
-    """
     kind = current_node["data"]["kind"]
 
     if not outgoing_edges:
         return None
 
-    # eval and condition nodes branch based on result
     if kind == "eval":
-        branch = result.get("branch")  # "pass" or "fail"
+        branch = result.get("branch")
         if not branch:
             raise Exception(f"Eval node {current_node['id']} returned no branch")
         for edge in outgoing_edges:
@@ -65,7 +74,7 @@ def pick_next_node(current_node, outgoing_edges, result, nodes_by_id):
         raise Exception(f"No edge found for eval branch: {branch}")
 
     if kind == "condition":
-        branch = str(result.get("branch", "")).lower()  # "true" or "false"
+        branch = str(result.get("branch", "")).lower()
         if not branch:
             raise Exception(f"Condition node {current_node['id']} returned no branch")
         for edge in outgoing_edges:
@@ -74,43 +83,84 @@ def pick_next_node(current_node, outgoing_edges, result, nodes_by_id):
                 return nodes_by_id[edge["target"]]
         raise Exception(f"No edge found for condition branch: {branch}")
 
-    # all other nodes — single outgoing edge
     return nodes_by_id[outgoing_edges[0]["target"]]
 
 
 def write_node_execution(run_ref, node, result):
-    """Write a node execution record to the run doc."""
     execution = {
-        "nodeId":        node["id"],
-        "nodeLabel":     node["data"].get("label"),
-        "kind":          node["data"].get("kind"),
-        "status":        "completed" if not result.get("error") else "failed",
-        "output":        result.get("output"),
+        "nodeId":         node["id"],
+        "nodeLabel":      node["data"].get("label"),
+        "kind":           node["data"].get("kind"),
+        "status":         "completed" if not result.get("error") else "failed",
+        "output":         result.get("output"),
         "outputVariable": result.get("outputVariable"),
-        "error":         result.get("error"),
-        "completedAt":   datetime.now(timezone.utc),
+        "error":          result.get("error"),
+        "completedAt":    datetime.now(timezone.utc),
     }
     run_ref.update({
         "nodeExecutions": firestore.ArrayUnion([execution]),
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
 
+
+def apply_column_mappings(item, node_data):
+    column_mappings = node_data.get("columnMappings", [])
+    row_data = {}
+    for mapping in column_mappings:
+        field = mapping.get("field")
+        column = mapping.get("column")
+        if not field or not column or column == "exclude":
+            continue
+        if isinstance(item, dict):
+            value = item.get(field)
+        else:
+            value = str(item) if item is not None else None
+        if value is not None:
+            row_data[column] = value
+    return row_data
+
+
+def node_references_column(node_data, column_keys):
+    """
+    Returns True if any string field in node_data contains @variable
+    where variable matches a column key. This means the node is intended
+    to run once per existing row rather than globally.
+    """
+    if not column_keys:
+        return False
+
+    column_key_set = set(column_keys)
+
+    def check_value(value):
+        if isinstance(value, str):
+            refs = re.findall(r'@(\w+)', value)
+            return any(ref in column_key_set for ref in refs)
+        if isinstance(value, dict):
+            return any(check_value(v) for v in value.values())
+        if isinstance(value, list):
+            return any(check_value(v) for v in value)
+        return False
+
+    return check_value(node_data)
+
+
+def flush_table_to_firestore(run_ref, column_keys, output_table_rows):
+    """Write the full in-memory table to Firestore as a map."""
+    rows_map = {str(i): row for i, row in enumerate(output_table_rows)}
+    run_ref.update({
+        "outputTable": {
+            "columns": column_keys,
+            "rows": rows_map,
+        },
+    })
+
+
 # ─── Main executor ────────────────────────────────────────────────────────────
 
 def execute_workflow(db, run_ref, run_data):
-    """
-    Main entry point. Fetches the workflow config, walks the graph,
-    executes each node in sequence, and writes results to Firebase.
-
-    Supports three start modes:
-    - Normal: starts from the trigger node
-    - resumeAtNodeId: starts at a specific node (used for review resume — skips eval)
-    - resumeFromNodeId: starts at the node AFTER the specified node
-    """
     agent_ref = run_ref.parent.parent
     version_id = run_data.get("versionId")
 
-    # fetch workflow config
     version_snap = (
         agent_ref.collection("versions")
                  .document(version_id)
@@ -122,19 +172,22 @@ def execute_workflow(db, run_ref, run_data):
     version = version_snap.to_dict()
     nodes = version.get("nodes", [])
     edges = version.get("edges", [])
+    output_type = version.get("outputType", "single")
+    table_columns = version.get("tableColumns", [])
+    column_keys = [col["key"] for col in table_columns]
+
+    run_data["outputType"] = output_type
 
     if not nodes:
         raise Exception("Workflow has no nodes")
 
-    # build lookup maps
     nodes_by_id, edges_by_source = build_lookup_maps(nodes, edges)
 
-    # --- determine start node ---
+    # determine start node
     resume_at_node_id   = run_data.get("resumeAtNodeId")
     resume_from_node_id = run_data.get("resumeFromNodeId")
 
     if resume_at_node_id:
-        # Start at this exact node — human review replaces the eval, jump to pass node
         if resume_at_node_id not in nodes_by_id:
             raise Exception(f"resumeAtNodeId {resume_at_node_id} not found in version")
         current_node = nodes_by_id[resume_at_node_id]
@@ -142,7 +195,6 @@ def execute_workflow(db, run_ref, run_data):
         logger.info(f"Resuming workflow at node {resume_at_node_id}")
 
     elif resume_from_node_id:
-        # Start from the node AFTER this one
         outgoing = edges_by_source.get(resume_from_node_id, [])
         if not outgoing:
             raise Exception(f"No outgoing edges from resumeFromNodeId {resume_from_node_id}")
@@ -154,36 +206,30 @@ def execute_workflow(db, run_ref, run_data):
         logger.info(f"Resuming workflow after node {resume_from_node_id} → starting at {current_node['id']}")
 
     else:
-        # Normal start — find trigger node
         current_node = find_trigger_node(nodes, edges)
         logger.info(f"Starting workflow execution from trigger node: {current_node['id']}")
 
-    # runtime variable map — starts with input variables
     variables = run_data.get("variables", {}).copy()
-
-    # cycle protection
+    output_table_rows = []
     visited = set()
 
     while current_node:
         node_id = current_node["id"]
         node_kind = current_node["data"].get("kind")
+        node_data = current_node["data"]
 
-        # cycle detection
         if node_id in visited:
             raise Exception(f"Cycle detected at node {node_id}")
         visited.add(node_id)
 
         logger.info(f"Executing node: {node_id} ({node_kind})")
 
-        # get executor for this node type
         executor_fn = NODE_EXECUTORS.get(node_kind)
         if not executor_fn:
             raise Exception(f"Unknown node kind: {node_kind}")
 
-        # interpolate variables into node config before executing
         interpolated_node = interpolate(current_node, variables)
 
-        # execute the node
         result = executor_fn(
             node=interpolated_node,
             variables=variables,
@@ -192,37 +238,120 @@ def execute_workflow(db, run_ref, run_data):
             run_data=run_data,
         )
 
-        # write node execution to Firebase
         write_node_execution(run_ref, current_node, result)
 
-        # handle pause (forReview, deepResearch, or other)
         if result.get("pause"):
-            if node_kind == "forReview":
-                logger.info(f"Run paused at node {node_id} for review")
-            elif node_kind == "deepResearch":
-                logger.info(f"Run paused at node {node_id} for deep research")
-            else:
-                logger.info(f"Run paused at node {node_id}")
+            logger.info(f"Run paused at node {node_id}")
             return
 
-        # handle node failure
         if result.get("error"):
             raise Exception(f"Node {node_id} failed: {result['error']}")
 
-        # write output variable to run doc if set
-        output_variable = result.get("outputVariable")
         output_value = result.get("output")
-        if output_variable and output_value is not None:
-            variables[output_variable] = output_value
-            run_ref.update({
-                f"variables.{output_variable}": output_value,
-                f"outputVariables.{output_variable}": output_value,
-            })
+        output_variable = result.get("outputVariable")
+
+        # ── table mode ────────────────────────────────────────────────────────
+        if output_type == "table":
+
+            if isinstance(output_value, list) and len(output_value) > 0:
+
+                is_per_row = (
+                    len(output_table_rows) > 0 and
+                    node_references_column(node_data, column_keys)
+                )
+
+                if is_per_row:
+                    # per-row producer — run once per existing row, expand table
+                    logger.info(f"[Table] Per-row producer node {node_id} — expanding {len(output_table_rows)} rows")
+                    expanded_rows = []
+                    for existing_row in output_table_rows:
+                        # inject existing row values and re-run
+                        row_variables = variables.copy()
+                        for col_key, col_value in existing_row.items():
+                            row_variables[col_key] = col_value
+
+                        interpolated_row_node = interpolate(current_node, row_variables)
+                        row_result = executor_fn(
+                            node=interpolated_row_node,
+                            variables=row_variables,
+                            db=db,
+                            run_ref=run_ref,
+                            run_data=run_data,
+                        )
+
+                        row_output = row_result.get("output")
+                        if isinstance(row_output, list):
+                            for item in row_output:
+                                new_row = existing_row.copy()  # preserve parent row values
+                                new_row.update(apply_column_mappings(item, node_data))
+                                expanded_rows.append(new_row)
+                        else:
+                            # node returned nothing for this row — keep original row
+                            expanded_rows.append(existing_row)
+
+                    output_table_rows = expanded_rows
+                    logger.info(f"[Table] Expanded to {len(output_table_rows)} rows")
+
+                else:
+                    # global producer — run once, append all items
+                    logger.info(f"[Table] Global row producer node {node_id} — appending {len(output_value)} rows")
+                    for item in output_value:
+                        row_data = apply_column_mappings(item, node_data)
+                        output_table_rows.append(row_data)
+
+                flush_table_to_firestore(run_ref, column_keys, output_table_rows)
+
+            elif node_data.get("tableOutputColumn") and node_data.get("tableOutputColumn") != "exclude":
+                # row analyzer — run once per existing row, add column
+                output_column = node_data["tableOutputColumn"]
+                logger.info(f"[Table] Row analyzer node {node_id} — processing {len(output_table_rows)} rows into column '{output_column}'")
+
+                for row_index, row in enumerate(output_table_rows):
+                    row_variables = variables.copy()
+                    for col_key, col_value in row.items():
+                        row_variables[col_key] = col_value
+
+                    interpolated_row_node = interpolate(current_node, row_variables)
+
+                    row_result = executor_fn(
+                        node=interpolated_row_node,
+                        variables=row_variables,
+                        db=db,
+                        run_ref=run_ref,
+                        run_data=run_data,
+                    )
+
+                    if row_result.get("error"):
+                        logger.warning(f"[Table] Node {node_id} failed for row {row_index}: {row_result['error']}")
+                        output_table_rows[row_index][output_column] = None
+                    else:
+                        row_output = row_result.get("output")
+                        output_table_rows[row_index][output_column] = row_output
+                        run_ref.update({
+                            f"outputTable.rows.{row_index}.{output_column}": row_output,
+                        })
+
+            else:
+                # normal node in table mode — save to variables
+                if output_variable and output_value is not None:
+                    variables[output_variable] = output_value
+                    run_ref.update({
+                        f"variables.{output_variable}": output_value,
+                        f"outputVariables.{output_variable}": output_value,
+                    })
+
+        # ── single mode ───────────────────────────────────────────────────────
+        else:
+            if output_variable and output_value is not None:
+                variables[output_variable] = output_value
+                run_ref.update({
+                    f"variables.{output_variable}": output_value,
+                    f"outputVariables.{output_variable}": output_value,
+                })
 
         # find next node
         outgoing = edges_by_source.get(node_id, [])
         if not outgoing:
-            # no more edges — workflow complete
             logger.info(f"Workflow completed — no more edges from node {node_id}")
             run_ref.update({
                 "status": "completed",
@@ -233,7 +362,6 @@ def execute_workflow(db, run_ref, run_data):
 
         current_node = pick_next_node(current_node, outgoing, result, nodes_by_id)
 
-    # reached end of graph
     run_ref.update({
         "status": "completed",
         "completedAt": firestore.SERVER_TIMESTAMP,

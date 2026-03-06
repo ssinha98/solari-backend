@@ -228,6 +228,7 @@ def _research_perplexity(node: dict, variables: dict, db, run_ref, run_data: dic
 
 RESEARCH_EXECUTORS = {
     "openai": _research_openai,
+    "openai deep research": _research_openai,
     "perplexity deep research": _research_perplexity,
     "perplexity sonar pro": _research_perplexity_sonar_pro,
 }

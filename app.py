@@ -1542,6 +1542,155 @@ def jira_oauth_callback():
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 # ============================================================================
+# PIPEDRIVE & APOLLO API KEY MANAGEMENT
+# ============================================================================
+
+@app.route("/api/pipedrive/api_key", methods=["POST"])
+@require_solari_key
+def pipedrive_add_api_key():
+    """
+    Add Pipedrive API key to team document.
+    Request body: { "user_id": "firebase_uid", "api_key": "pipedrive_api_key" }
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id") or body.get("userId")
+    api_key = (body.get("api_key") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id is required"}), 400
+    if not api_key:
+        return jsonify({"ok": False, "error": "api_key is required"}), 400
+    db = firestore.client()
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    db.collection("teams").document(team_id).set({"pipedrive_api_key": api_key}, merge=True)
+    logger.info(f"Pipedrive API key saved for team {team_id}")
+    return jsonify({"ok": True, "message": "Pipedrive API key saved"}), 200
+
+@app.route("/api/pipedrive/api_key", methods=["DELETE"])
+@require_solari_key
+def pipedrive_delete_api_key():
+    """
+    Remove Pipedrive API key from team document.
+    Request body: { "user_id": "firebase_uid" }
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id") or body.get("userId")
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id is required"}), 400
+    db = firestore.client()
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    db.collection("teams").document(team_id).update({"pipedrive_api_key": firestore.DELETE_FIELD})
+    logger.info(f"Pipedrive API key removed for team {team_id}")
+    return jsonify({"ok": True, "message": "Pipedrive API key removed"}), 200
+
+@app.route("/api/pipedrive/test_write_lead", methods=["POST"])
+@require_solari_key
+def pipedrive_test_write_lead():
+    """
+    Test endpoint for Pipedrive write lead.
+    Request body: { "user_id": "firebase_uid" }
+    Uses user_id to resolve team_id, then writes a test lead with dummy data.
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id") or body.get("userId")
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id is required"}), 400
+
+    db = firestore.client()
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+    from workflow.nodes.pipedrive import write_lead, _get_pipedrive_api_key
+
+    api_key = _get_pipedrive_api_key(db, team_id)
+    if not api_key:
+        return jsonify({
+            "ok": False,
+            "error": "PIPEDRIVE_API_KEY not set on team doc or in environment",
+        }), 400
+
+    # Dummy test data
+    name = "Test Lead (API)"
+    company = "Test Corp"
+    email = "test-lead@example.com"
+    linkedin = "https://linkedin.com/in/test-lead"
+
+    try:
+        lead_id = write_lead(
+            name=name,
+            company=company,
+            email=email,
+            linkedin=linkedin,
+            api_token=api_key,
+            db=db,
+            team_id=team_id,
+        )
+        return jsonify({
+            "ok": True,
+            "lead_id": lead_id,
+            "team_id": team_id,
+            "written": {
+                "name": name,
+                "company": company,
+                "email": email,
+                "linkedin": linkedin,
+            },
+        }), 200
+    except Exception as e:
+        logger.exception("Pipedrive test_write_lead failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/apollo/api_key", methods=["POST"])
+@require_solari_key
+def apollo_add_api_key():
+    """
+    Add Apollo API key to team document.
+    Request body: { "user_id": "firebase_uid", "api_key": "apollo_api_key" }
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id") or body.get("userId")
+    api_key = (body.get("api_key") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id is required"}), 400
+    if not api_key:
+        return jsonify({"ok": False, "error": "api_key is required"}), 400
+    db = firestore.client()
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    db.collection("teams").document(team_id).set({"apollo_api_key": api_key}, merge=True)
+    logger.info(f"Apollo API key saved for team {team_id}")
+    return jsonify({"ok": True, "message": "Apollo API key saved"}), 200
+
+@app.route("/api/apollo/api_key", methods=["DELETE"])
+@require_solari_key
+def apollo_delete_api_key():
+    """
+    Remove Apollo API key from team document.
+    Request body: { "user_id": "firebase_uid" }
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id") or body.get("userId")
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id is required"}), 400
+    db = firestore.client()
+    try:
+        team_id = get_team_id_for_uid(db, user_id)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    db.collection("teams").document(team_id).update({"apollo_api_key": firestore.DELETE_FIELD})
+    logger.info(f"Apollo API key removed for team {team_id}")
+    return jsonify({"ok": True, "message": "Apollo API key removed"}), 200
+
+# ============================================================================
 # JIRA TICKET QUERY CODE (using OAuth credentials)
 # ============================================================================
 
@@ -3387,9 +3536,10 @@ def test_scrape():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-def _parse_openai_deep_research_response(response_data: dict) -> dict:
+def _parse_openai_deep_research_response(response_data: dict) -> str:
     """
-    Parse OpenAI /v1/responses/{id} body into a single object: main_text plus annotations/urls.
+    Parse OpenAI /v1/responses/{id} body into a plain string matching Perplexity format:
+    main text + "\n\n" + numbered unique URLs ([1] url, [2] url, ...).
     Response has output[] with type "message", content[] with type "output_text", text, annotations.
     """
     main_text_parts = []
@@ -3404,11 +3554,10 @@ def _parse_openai_deep_research_response(response_data: dict) -> dict:
             annotations.extend(content.get("annotations", []))
     main_text = "\n\n".join(main_text_parts).strip()
     urls = sorted({a.get("url") for a in annotations if a.get("url")})
-    return {
-        "main_text": main_text,
-        "annotations": annotations,
-        "urls": urls,
-    }
+    citation_lines = [f"[{i + 1}] {url}" for i, url in enumerate(urls)]
+    if citation_lines:
+        return main_text + "\n\n" + "\n".join(citation_lines)
+    return main_text
 
 
 @app.route("/api/openai-deep-research-callback", methods=["POST"])
@@ -10710,13 +10859,22 @@ def get_agent():
             )
             if version_snap.exists:
                 version_data = version_snap.to_dict()
+                # debug: print what we're seeing from Firebase
+                logger.info(
+                    f"[get_agent] version_id={version_id_to_fetch} "
+                    f"version_data_keys={list(version_data.keys())} "
+                    f"tableColumns={version_data.get('tableColumns')}"
+                )
                 workflow_config = {
                     "versionId": version_snap.id,
                     "label": version_data.get("label"),
                     "createdAt": version_data.get("createdAt"),
                     "nodes": version_data.get("nodes", []),
                     "edges": version_data.get("edges", []),
+                    "outputType": version_data.get("outputType", "single"),
+                    "tableColumns": version_data.get("tableColumns", []),
                 }
+                logger.info(f"[get_agent] workflow_config keys={list(workflow_config.keys())} tableColumns={workflow_config.get('tableColumns')}")
 
         return jsonify({
             "success": True,
@@ -10871,6 +11029,246 @@ def list_agent_versions():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+VALID_OUTPUT_TYPES = {"single", "table"}
+
+
+@app.route('/api/workflow/version/set-output-type', methods=['POST'])
+@require_solari_key
+def set_version_output_type():
+    """
+    Set outputType on the active version doc.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "output_type": "single" | "table"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        output_type = data.get("output_type") or data.get("outputType")
+
+        if not user_id or not agent_id or not output_type:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, output_type"
+            }), 400
+
+        if output_type not in VALID_OUTPUT_TYPES:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid output_type. Must be one of: {', '.join(sorted(VALID_OUTPUT_TYPES))}"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        active_version_id = agent_snap.to_dict().get("activeVersionId")
+        if not active_version_id:
+            return jsonify({
+                "success": False,
+                "error": "No active version. Save a workflow version first."
+            }), 404
+
+        version_ref = agent_ref.collection("versions").document(active_version_id)
+        if not version_ref.get().exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        version_ref.update({
+            "outputType": output_type,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "versionId": active_version_id,
+            "outputType": output_type,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in set_version_output_type: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/version/get-table-columns', methods=['POST'])
+@require_solari_key
+def get_table_columns():
+    """
+    Get table columns for a workflow version.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "version_id": "version_id"  // optional — defaults to active version
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        version_id = data.get("version_id") or data.get("versionId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+
+        # default to active version if not specified
+        if not version_id:
+            agent_snap = agent_ref.get()
+            if not agent_snap.exists:
+                return jsonify({"success": False, "error": "agent_not_found"}), 404
+            version_id = agent_snap.to_dict().get("activeVersionId")
+            if not version_id:
+                return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_snap = (
+            agent_ref.collection("versions")
+                     .document(version_id)
+                     .get()
+        )
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        version_data = version_snap.to_dict()
+        table_columns = version_data.get("tableColumns", [])
+        logger.info(
+            f"[get_table_columns] version_id={version_id} "
+            f"version_data_keys={list(version_data.keys())} "
+            f"tableColumns_count={len(table_columns)} tableColumns={table_columns}"
+        )
+
+        return jsonify({
+            "success": True,
+            "versionId": version_id,
+            "outputType": version_data.get("outputType", "single"),
+            "tableColumns": table_columns,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_table_columns: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/version/update-table-columns', methods=['POST'])
+@require_solari_key
+def update_table_columns():
+    """
+    Add, remove or reorder table columns on a workflow version.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "version_id": "version_id",  // optional — defaults to active version
+        "tableColumns": [
+            { "key": "company_name", "label": "Company Name" },
+            { "key": "website",      "label": "Website"      },
+            { "key": "summary",      "label": "Summary"      }
+        ]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        version_id = data.get("version_id") or data.get("versionId")
+        table_columns = data.get("tableColumns") or data.get("table_columns")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        if table_columns is None:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameter: tableColumns"
+            }), 400
+
+        if not isinstance(table_columns, list):
+            return jsonify({
+                "success": False,
+                "error": "tableColumns must be an array"
+            }), 400
+
+        # validate each column has key and label
+        for col in table_columns:
+            if not col.get("key") or not col.get("label"):
+                return jsonify({
+                    "success": False,
+                    "error": "Each column must have a key and label"
+                }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+
+        # default to active version if not specified
+        if not version_id:
+            agent_snap = agent_ref.get()
+            if not agent_snap.exists:
+                return jsonify({"success": False, "error": "agent_not_found"}), 404
+            version_id = agent_snap.to_dict().get("activeVersionId")
+            if not version_id:
+                return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_ref = agent_ref.collection("versions").document(version_id)
+        version_snap = version_ref.get()
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        version_ref.update({
+            "tableColumns": table_columns,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "versionId": version_id,
+            "tableColumns": table_columns,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in update_table_columns: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/workflow/save-version", methods=['POST'])
 @require_solari_key
 def save_version_draft():
@@ -10946,15 +11344,29 @@ def save_version_draft():
         new_count = (agent_data.get("versionCount") or 0) + 1
         version_ref = agent_ref.collection("versions").document()
 
-        batch = db.batch()
-        batch.set(version_ref, {
+        # preserve outputType and tableColumns from current active version
+        new_version_data = {
             "label": f"v{new_count}",
             "hash": incoming_hash,
             "createdAt": firestore.SERVER_TIMESTAMP,
             "savedBy": user_id,
             "nodes": nodes,
             "edges": edges,
-        })
+        }
+        active_version_id = agent_data.get("activeVersionId")
+        if active_version_id:
+            prev_version_snap = agent_ref.collection("versions").document(active_version_id).get()
+            if prev_version_snap.exists:
+                prev_data = prev_version_snap.to_dict() or {}
+                # always copy outputType and tableColumns when present (including empty)
+                if "outputType" in prev_data and prev_data["outputType"]:
+                    new_version_data["outputType"] = prev_data["outputType"]
+                if "tableColumns" in prev_data:
+                    new_version_data["tableColumns"] = prev_data["tableColumns"]
+                    logger.info(f"[save_version_draft] preserved from prev version {active_version_id}: outputType={prev_data.get('outputType')} tableColumns={len(prev_data.get('tableColumns') or [])} items")
+
+        batch = db.batch()
+        batch.set(version_ref, new_version_data)
         batch.update(agent_ref, {
             "versionCount": new_count,
             "activeVersionId": version_ref.id,  
@@ -11035,7 +11447,20 @@ def add_for_review():
                 "error": "agent_not_found"
             }), 404
 
-        agent_name = agent_snap.to_dict().get("name")
+        agent_data = agent_snap.to_dict()
+        agent_name = agent_data.get("name")
+
+        # fetch output_type from active version doc
+        output_type = "single"
+        active_version_id = agent_data.get("activeVersionId")
+        if active_version_id:
+            version_snap = (
+                agent_ref.collection("versions")
+                         .document(active_version_id)
+                         .get()
+            )
+            if version_snap.exists:
+                output_type = version_snap.to_dict().get("outputType", "single")
 
         # save to global for-review subcollection on the team
         review_ref = (
@@ -11043,22 +11468,24 @@ def add_for_review():
               .collection("forReview").document()
         )
         review_ref.set({
-            "agentId":   agent_id,
-            "agentName": agent_name,
-            "runId":     run_id,
-            "nodeId":    node_id,
-            "nodeLabel": node_label,
-            "input":     input_data,
-            "output":    output_data,
-            "notes":     notes,
-            "status":    "pending",
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "createdBy": user_id,
+            "agentId":    agent_id,
+            "agentName":  agent_name,
+            "runId":      run_id,
+            "nodeId":     node_id,
+            "nodeLabel":  node_label,
+            "input":      input_data,
+            "output":     output_data,
+            "notes":      notes,
+            "outputType": output_type,
+            "status":     "pending",
+            "createdAt":  firestore.SERVER_TIMESTAMP,
+            "createdBy":  user_id,
         })
 
         return jsonify({
-            "success": True,
-            "reviewId": review_ref.id,
+            "success":    True,
+            "reviewId":   review_ref.id,
+            "outputType": output_type,
         }), 200
 
     except Exception as e:
@@ -11164,6 +11591,92 @@ def get_for_review_item():
         logger.error(f"Error in get_for_review_item: {str(e)}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route('/api/workflow/review/get-table', methods=['POST'])
+@require_solari_key
+def get_review_table():
+    """
+    Fetch the outputTable for a paused table-mode run.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id"
+    }
+
+    Response:
+    {
+        "success": true,
+        "outputTable": {
+            "columns": ["website_url", "title", "description", "llm_summary"],
+            "rows": {
+                "0": { "website_url": "...", "title": "...", ... },
+                "1": { ... },
+                ...
+            }
+        },
+        "tableColumns": [
+            { "key": "website_url", "label": "Website URL" },
+            ...
+        ],
+        "runId": "run_id",
+        "agentName": "My Agent"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id  = data.get("user_id")  or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id   = data.get("run_id")   or data.get("runId")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_data = run_snap.to_dict()
+
+        # fetch tableColumns from version doc for labels
+        version_id = run_data.get("versionId")
+        table_columns = []
+        if version_id:
+            version_snap = (
+                db.collection("teams").document(team_id)
+                  .collection("agents").document(agent_id)
+                  .collection("versions").document(version_id)
+                  .get()
+            )
+            if version_snap.exists:
+                table_columns = version_snap.to_dict().get("tableColumns", [])
+
+        return jsonify({
+            "success":      True,
+            "outputTable":  run_data.get("outputTable", {}),
+            "tableColumns": table_columns,
+            "runId":        run_id,
+            "agentName":    run_data.get("agentName"),
+            "status":       run_data.get("status"),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in get_review_table: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/workflow/for-review/list', methods=['POST'])
 @require_solari_key
@@ -11401,6 +11914,155 @@ def update_for_review():
             "success": False,
             "error": str(e)
         }), 500
+
+@app.route('/api/workflow/review/update-cell', methods=['POST'])
+@require_solari_key
+def review_update_cell():
+    """
+    Update a single cell in the outputTable of a run doc.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id",
+        "row_index": 2,
+        "column": "summary",
+        "value": "Updated value"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+        row_index = data.get("row_index") if data.get("row_index") is not None else data.get("rowIndex")
+        column = data.get("column")
+        value = data.get("value")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        if row_index is None or not column:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: row_index, column"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        run_ref.update({
+            f"outputTable.rows.{row_index}.{column}": value,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "rowIndex": row_index,
+            "column": column,
+            "value": value,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in review_update_cell: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/review/delete-rows', methods=['POST'])
+@require_solari_key
+def review_delete_rows():
+    """
+    Delete one or more rows from outputTable.rows in a run doc.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "run_id": "run_id",
+        "row_indices": [0, 2, 5]   // array of row indices to delete
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        run_id = data.get("run_id") or data.get("runId")
+        row_indices = data.get("row_indices") or data.get("rowIndices")
+
+        if not user_id or not agent_id or not run_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, run_id"
+            }), 400
+
+        if not isinstance(row_indices, list) or len(row_indices) == 0:
+            return jsonify({
+                "success": False,
+                "error": "row_indices must be a non-empty array"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        run_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs").document(run_id)
+        )
+
+        run_snap = run_ref.get()
+        if not run_snap.exists:
+            return jsonify({"success": False, "error": "run_not_found"}), 404
+
+        output_table = run_snap.to_dict().get("outputTable", {})
+        rows = output_table.get("rows", {})
+
+        deleted = []
+        not_found = []
+        for idx in row_indices:
+            key = str(idx)
+            if key in rows:
+                del rows[key]
+                deleted.append(idx)
+            else:
+                not_found.append(idx)
+
+        output_table["rows"] = rows
+        run_ref.update({
+            "outputTable": output_table,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "deleted": deleted,
+            "notFound": not_found,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in review_delete_rows: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 # ---------------------------------------------------------------------------
 # POST /api/workflow/for-review/resume
@@ -11903,6 +12565,124 @@ def update_node_data():
         logger.error(f"Error in update_node_data: {str(e)}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
+
+@app.route('/api/workflow/node/remove-input-variable', methods=['POST'])
+@require_solari_key
+def remove_input_variable():
+    """
+    Remove an input variable from a node (e.g. inputVariableName2, inputVariableType2).
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "node_id": "n2",
+        "input_variable_number": 2
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+        node_id = data.get("node_id") or data.get("nodeId")
+        num = data.get("input_variable_number") or data.get("inputVariableNumber")
+
+        if not user_id or not agent_id or not node_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, node_id",
+            }), 400
+
+        if num is None:
+            return jsonify({
+                "success": False,
+                "error": "Missing input_variable_number (1-5)",
+            }), 400
+
+        try:
+            num = int(num)
+        except (TypeError, ValueError):
+            return jsonify({
+                "success": False,
+                "error": "input_variable_number must be an integer",
+            }), 400
+
+        if num < 1 or num > 5:
+            return jsonify({
+                "success": False,
+                "error": "input_variable_number must be between 1 and 5",
+            }), 400
+
+        suffix = "" if num == 1 else str(num)
+        name_key = f"inputVariableName{suffix}"
+        type_key = f"inputVariableType{suffix}"
+        optional_key = f"inputVariableOptional{suffix}"
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+            .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        active_version_id = agent_snap.to_dict().get("activeVersionId")
+        if not active_version_id:
+            return jsonify({"success": False, "error": "no_active_version"}), 404
+
+        version_ref = agent_ref.collection("versions").document(active_version_id)
+        version_snap = version_ref.get()
+        if not version_snap.exists:
+            return jsonify({"success": False, "error": "version_not_found"}), 404
+
+        nodes = version_snap.to_dict().get("nodes", [])
+        node_found = False
+        updated_nodes = []
+
+        for node in nodes:
+            if node.get("id") == node_id:
+                node_found = True
+                node_data = dict(node.get("data", {}))
+                removed = []
+                if name_key in node_data:
+                    del node_data[name_key]
+                    removed.append(name_key)
+                if type_key in node_data:
+                    del node_data[type_key]
+                    removed.append(type_key)
+                if optional_key in node_data:
+                    del node_data[optional_key]
+                    removed.append(optional_key)
+                updated_nodes.append({**node, "data": node_data})
+            else:
+                updated_nodes.append(node)
+
+        if not node_found:
+            return jsonify({"success": False, "error": "node_not_found"}), 404
+
+        version_ref.update({
+            "nodes": updated_nodes,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        return jsonify({
+            "success": True,
+            "node_id": node_id,
+            "removed": removed if removed else [],
+            "data": next(n["data"] for n in updated_nodes if n["id"] == node_id),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in remove_input_variable: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/workflow/node/delete', methods=['POST'])
 @require_solari_key
 def delete_node():
@@ -12034,21 +12814,27 @@ def get_input_variables():
 
         nodes = version_snap.to_dict().get("nodes", [])
 
-        # collect all nodes that have inputVariable defined
+        # collect all nodes that have inputVariable defined (supports multiple per node)
+        # keys: inputVariableName, inputVariableName2, inputVariableName3, ...
+        input_var_keys = ["inputVariableName", "inputVariableName2", "inputVariableName3", "inputVariableName4", "inputVariableName5"]
         input_variables = []
         for node in nodes:
             node_data = node.get("data", {})
-            input_var = node_data.get("inputVariableName")
-            input_var_type = node_data.get("inputVariableType")  # e.g. "text" | "file"
-
-            if input_var:
-                input_variables.append({
-                    "nodeId": node.get("id"),
-                    "nodeLabel": node_data.get("label"),
-                    "nodeKind": node_data.get("kind"),
-                    "inputVariableName": input_var,
-                    "inputVariableType": input_var_type or "text",  # default to text
-                })
+            for key in input_var_keys:
+                input_var = node_data.get(key)
+                if input_var:
+                    type_key = key.replace("inputVariableName", "inputVariableType")
+                    optional_key = key.replace("inputVariableName", "inputVariableOptional")
+                    input_var_type = node_data.get(type_key)  # e.g. "text" | "file"
+                    input_var_optional = node_data.get(optional_key, False)  # default required
+                    input_variables.append({
+                        "nodeId": node.get("id"),
+                        "nodeLabel": node_data.get("label"),
+                        "nodeKind": node_data.get("kind"),
+                        "inputVariableName": input_var,
+                        "inputVariableType": input_var_type or "text",  # default to text
+                        "inputVariableOptional": input_var_optional,
+                    })
 
         return jsonify({
             "success": True,
@@ -12244,23 +13030,29 @@ def create_run():
 
         nodes = version_snap.to_dict().get("nodes", [])
 
-        # validate all required input variables have non-null values
+        # validate all required input variables have non-null values (supports multiple per node)
+        input_var_keys = ["inputVariableName", "inputVariableName2", "inputVariableName3", "inputVariableName4", "inputVariableName5"]
         missing = []
         for node in nodes:
             node_data = node.get("data", {})
             if not node_data.get("requiresInputVariable"):
                 continue
-            var_name = node_data.get("inputVariableName")
-            if not var_name:
-                continue
-            value = input_variables.get(var_name)
-            if value is None or value == "":
-                missing.append({
-                    "nodeId": node.get("id"),
-                    "nodeLabel": node_data.get("label"),
-                    "inputVariableName": var_name,
-                    "inputVariableType": node_data.get("inputVariableType", "text"),
-                })
+            for key in input_var_keys:
+                var_name = node_data.get(key)
+                if not var_name:
+                    continue
+                optional_key = key.replace("inputVariableName", "inputVariableOptional")
+                if node_data.get(optional_key, False):
+                    continue  # skip optional variables
+                value = input_variables.get(var_name)
+                if value is None or value == "":
+                    type_key = key.replace("inputVariableName", "inputVariableType")
+                    missing.append({
+                        "nodeId": node.get("id"),
+                        "nodeLabel": node_data.get("label"),
+                        "inputVariableName": var_name,
+                        "inputVariableType": node_data.get(type_key, "text"),
+                    })
 
         if missing:
             return jsonify({

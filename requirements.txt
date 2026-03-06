@@ -18,6 +18,7 @@ duckdb==1.0.0
 et_xmlfile==2.0.0
 firebase_admin==7.1.0
 firecrawl==4.11.0
+perplexityai
 Flask==3.1.2
 flask-cors==6.0.2
 frozenlist==1.8.0

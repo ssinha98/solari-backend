@@ -1,5 +1,6 @@
 import logging
-from workflow.connectors import slack, jira, confluence
+from workflow.connectors import slack, jira, confluence, apollo
+from workflow.nodes import pipedrive
 
 logger = logging.getLogger(__name__)
 
@@ -7,6 +8,8 @@ CONNECTOR_EXECUTORS = {
     "slack":       slack.execute,
     "jira":        jira.execute,
     "confluence":  confluence.execute,
+    "apollo":      apollo.execute,
+    "pipedrive":   pipedrive.execute,
 }
 
 def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:

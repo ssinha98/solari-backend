@@ -23,31 +23,30 @@ def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:
     agent_name = run_data.get("agentName")
     team_id    = run_data.get("teamId")
     run_id     = run_ref.id
+    output_type = run_data.get("outputType", "single")
 
-    # get the input — output of the preceding node
-    # last value written to variables before this node
     input_text = str(list(variables.values())[-1]) if variables else ""
 
     logger.info(f"ForReview node '{label}' creating review task")
 
     try:
-        # create forReview document
         review_ref = (
             db.collection("teams").document(team_id)
               .collection("forReview").document()
         )
         review_ref.set({
-            "teamId":    team_id,
-            "agentId":   agent_id,
-            "agentName": agent_name,
-            "runId":     run_id,
-            "nodeId": node_id,
-            "nodeLabel": label,
-            "input": input_text,
-            "output": "",           # populated when reviewer edits/approves
-            "notes": notes,
-            "status": "pending",
-            "createdAt": firestore.SERVER_TIMESTAMP,
+            "teamId":     team_id,
+            "agentId":    agent_id,
+            "agentName":  agent_name,
+            "runId":      run_id,
+            "nodeId":     node_id,
+            "nodeLabel":  label,
+            "input":      input_text,
+            "output":     "",
+            "notes":      notes,
+            "outputType": output_type,
+            "status":     "pending",
+            "createdAt":  firestore.SERVER_TIMESTAMP,
             "resolvedAt": None,
             "resolvedBy": None,
         })
