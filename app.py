@@ -14173,7 +14173,7 @@ def agent_store_install():
                 agent_data = {
                     "name":              entry_name,
                     "description":       description,
-                    "agentType":         agent_type,
+                    "type":              agent_type,
                     "activeVersionId":   version_ref.id,
                     "versionCount":      1,
                     "lastVersionHash":   version_hash,
