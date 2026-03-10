@@ -3469,7 +3469,7 @@ def scrape_website_structured(url: str, prompt: str) -> dict:
         "type": "json",
         "schema": schema,
         "prompt": prompt,
-    }])
+    }], proxy="auto")
     # Normalize to JSON-serializable dict. SDK may return full { success, data } or the data object directly.
     def _to_json_dict(obj):
         if obj is None or isinstance(obj, dict):
@@ -12156,6 +12156,7 @@ def resume_from_review():
 
         version_data = version_snap.to_dict()
         nodes = version_data.get("nodes", [])
+        edges = version_data.get("edges", [])
 
         # find the eval node that routes to the forReview node on fail
         for_review_node_id = review_data.get("nodeId")  # e.g. "n6"
@@ -12163,18 +12164,35 @@ def resume_from_review():
             (n for n in nodes if n.get("data", {}).get("evalFailNodeId") == for_review_node_id),
             None
         )
-        if not eval_node:
-            return jsonify({
-                "success": False,
-                "error": f"Could not find eval node routing to forReview node {for_review_node_id}"
-            }), 400
 
-        eval_pass_node_id = eval_node.get("data", {}).get("evalPassNodeId")
-        if not eval_pass_node_id:
-            return jsonify({
-                "success": False,
-                "error": "Eval node has no evalPassNodeId"
-            }), 400
+        if eval_node:
+            # eval → forReview pattern: skip the eval and jump to its pass path
+            eval_pass_node_id = eval_node.get("data", {}).get("evalPassNodeId")
+            if not eval_pass_node_id:
+                return jsonify({
+                    "success": False,
+                    "error": "Eval node has no evalPassNodeId"
+                }), 400
+            resume_field = "resumeAtNodeId"
+            resume_node_id = eval_pass_node_id
+            logger.info(
+                f"Run {run_id}: forReview node {for_review_node_id} preceded by eval — "
+                f"resuming at eval pass node {eval_pass_node_id}."
+            )
+        else:
+            # linear flow: just follow the outgoing edge from the forReview node
+            outgoing = [e for e in edges if e.get("source") == for_review_node_id]
+            if not outgoing:
+                return jsonify({
+                    "success": False,
+                    "error": f"No outgoing edges from forReview node {for_review_node_id}"
+                }), 400
+            resume_field = "resumeFromNodeId"
+            resume_node_id = for_review_node_id
+            logger.info(
+                f"Run {run_id}: forReview node {for_review_node_id} in linear flow — "
+                f"resuming from node {for_review_node_id} (next node: {outgoing[0].get('target')})."
+            )
 
         # --- patch variables with reviewer's value (or original if unchanged) ---
         original_input   = review_data.get("input")
@@ -12199,10 +12217,10 @@ def resume_from_review():
             "resolvedBy":    user_id,
         })
 
-        # --- update run doc: patch variables, set resumeAtNodeId, re-queue ---
+        # --- update run doc: patch variables, set resume field, re-queue ---
         run_ref.update({
             "status":          "queued",
-            "resumeAtNodeId":  eval_pass_node_id,  # e.g. "n5" — skip eval entirely
+            resume_field:      resume_node_id,
             "variables":       variables,
             "outputVariables": output_variables,
             "blockedOn":       firestore.DELETE_FIELD,
@@ -12211,16 +12229,11 @@ def resume_from_review():
             "updatedAt":       now,
         })
 
-        logger.info(
-            f"Run {run_id} resumed from review {review_id}. "
-            f"Skipping eval, resuming at pass node {eval_pass_node_id}."
-        )
-
         return jsonify({
-            "success":        True,
-            "runId":          run_id,
-            "reviewId":       review_id,
-            "resumeAtNodeId": eval_pass_node_id,
+            "success":    True,
+            "runId":      run_id,
+            "reviewId":   review_id,
+            resume_field: resume_node_id,
         }), 200
 
     except Exception as e:
@@ -13708,6 +13721,232 @@ def get_run_status():
 
     except Exception as e:
         logger.error(f"Error in get_run_status: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/sources/add', methods=['POST'])
+@require_solari_key
+def add_source():
+    """
+    Add a new source to the team's sources subcollection.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id",
+        "type": "pipedrive",
+        "source_name": "My CRM",
+        "contents": "optional text contents"  // optional
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id    = data.get("user_id")    or data.get("userId")
+        agent_id   = data.get("agent_id")   or data.get("agentId")
+        source_type = data.get("type")
+        source_name = data.get("source_name") or data.get("sourceName")
+        contents   = data.get("contents")
+
+        if not user_id or not agent_id or not source_type or not source_name:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id, type, source_name"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        payload = {
+            "type":      source_type,
+            "name":      source_name,
+            "agentId":   agent_id,
+            "teamId":    team_id,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        }
+        if contents is not None:
+            payload["contents"] = contents
+
+        source_ref = (
+            db.collection("teams").document(team_id)
+              .collection("sources").document()
+        )
+        source_ref.set(payload)
+
+        return jsonify({
+            "success":  True,
+            "sourceId": source_ref.id,
+            "teamId":   team_id,
+            "agentId":  agent_id,
+            "type":     source_type,
+            "name":     source_name,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in add_source: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/sources/list', methods=['POST'])
+@require_solari_key
+def list_sources():
+    """
+    List all sources in the team's sources subcollection, optionally filtered by type.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "type": "pipedrive"  // optional — filter by source type
+    }
+
+    Response:
+    {
+        "success": true,
+        "sources": [
+            {
+                "sourceId": "...",
+                "type": "...",
+                "nickname": "...",
+                "name": "...",
+                "description": "...",
+                "url": "...",
+                "id": "..."
+            }
+        ]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        type_filter = data.get("type")
+
+        if not user_id:
+            return jsonify({"success": False, "error": "Missing required parameter: user_id"}), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        sources_ref = db.collection("teams").document(team_id).collection("sources")
+
+        if type_filter:
+            query = sources_ref.where("type", "==", type_filter)
+        else:
+            query = sources_ref
+
+        docs = query.stream()
+
+        sources = []
+        for doc in docs:
+            d = doc.to_dict()
+            sources.append({
+                "sourceId":    doc.id,
+                "type":        d.get("type"),
+                "nickname":    d.get("nickname"),
+                "name":        d.get("name"),
+                "description": d.get("description"),
+                "url":         d.get("url"),
+                "title":       d.get("title"),
+                "id":          d.get("id"),
+                "contents":    d.get("contents"),
+            })
+
+        return jsonify({
+            "success": True,
+            "sources": sources,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in list_sources: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/workflow/run/list', methods=['POST'])
+@require_solari_key
+def list_agent_runs():
+    """
+    Return currently active runs and the last 3 completed runs for an agent.
+
+    Request Body:
+    {
+        "user_id": "firebase_uid",
+        "agent_id": "agent_id"
+    }
+
+    Response:
+    {
+        "success": true,
+        "activeRuns": [ ...runs with status queued/running/paused ],
+        "recentRuns": [ ...last 3 runs ordered by startedAt desc ]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id") or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required parameters: user_id, agent_id"
+            }), 400
+
+        db = firestore.client()
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        runs_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+              .collection("runs")
+        )
+
+        def serialize_run(run_id, run_data):
+            return {
+                "runId":         run_id,
+                "status":        run_data.get("status"),
+                "versionLabel":  run_data.get("versionLabel"),
+                "triggerSource": run_data.get("triggerSource"),
+                "startedAt":     run_data.get("startedAt").isoformat() if run_data.get("startedAt") else None,
+                "completedAt":   run_data.get("completedAt").isoformat() if run_data.get("completedAt") else None,
+                "failedAt":      run_data.get("failedAt").isoformat() if run_data.get("failedAt") else None,
+                "pausedAtNodeId": run_data.get("pausedAtNodeId"),
+                "blockedOn":     run_data.get("blockedOn"),
+                "failureReason": run_data.get("failureReason"),
+            }
+
+        # active runs: queued, running, or paused
+        active_snaps = (
+            runs_ref
+            .where("status", "in", ["queued", "running", "paused"])
+            .order_by("startedAt", direction=firestore.Query.DESCENDING)
+            .stream()
+        )
+        active_runs = [serialize_run(s.id, s.to_dict()) for s in active_snaps]
+
+        # last 3 runs regardless of status
+        recent_snaps = (
+            runs_ref
+            .order_by("startedAt", direction=firestore.Query.DESCENDING)
+            .limit(3)
+            .stream()
+        )
+        recent_runs = [serialize_run(s.id, s.to_dict()) for s in recent_snaps]
+
+        return jsonify({
+            "success":    True,
+            "activeRuns": active_runs,
+            "recentRuns": recent_runs,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in list_agent_runs: {str(e)}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
 

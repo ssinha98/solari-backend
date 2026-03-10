@@ -1,4 +1,6 @@
 import re
+import time
+import random
 import logging
 from datetime import datetime, timezone
 from firebase_admin import firestore
@@ -123,8 +125,7 @@ def apply_column_mappings(item, node_data):
 def node_references_column(node_data, column_keys):
     """
     Returns True if any string field in node_data contains @variable
-    where variable matches a column key. This means the node is intended
-    to run once per existing row rather than globally.
+    where variable matches a column key.
     """
     if not column_keys:
         return False
@@ -153,6 +154,52 @@ def flush_table_to_firestore(run_ref, column_keys, output_table_rows):
             "rows": rows_map,
         },
     })
+
+
+def build_table_variable(column_keys, output_table_rows):
+    """
+    Build the outputTable structure expected by the interpolator's
+    is_output_table() check — canonical columns from version config,
+    rows as an indexed map.
+    """
+    return {
+        "columns": column_keys,
+        "rows": {str(i): row for i, row in enumerate(output_table_rows)},
+    }
+
+
+def execute_with_retry(executor_fn, node_data, max_retries=3, **kwargs):
+    """
+    Execute a node function with:
+    - Proactive delay (rateLimitDelay from node config, default 300ms for row loops)
+    - Retry on 429 with exponential backoff + jitter
+    - Respect Retry-After header if present
+    """
+    rate_limit_delay = node_data.get("rateLimitDelay", 0.3)
+    if rate_limit_delay > 0:
+        time.sleep(rate_limit_delay)
+
+    for attempt in range(max_retries):
+        try:
+            return executor_fn(**kwargs)
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "rate limit" in str(e).lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                # check for Retry-After header
+                retry_after = None
+                if hasattr(e, 'response') and e.response is not None:
+                    retry_after = e.response.headers.get("Retry-After")
+
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    # exponential backoff + jitter
+                    wait = (2 ** attempt) + random.uniform(0, 0.5)
+
+                logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {wait:.2f}s...")
+                time.sleep(wait)
+            else:
+                raise
 
 
 # ─── Main executor ────────────────────────────────────────────────────────────
@@ -210,7 +257,13 @@ def execute_workflow(db, run_ref, run_data):
         logger.info(f"Starting workflow execution from trigger node: {current_node['id']}")
 
     variables = run_data.get("variables", {}).copy()
-    output_table_rows = []
+
+    # Site 1: re-hydrate table rows from Firestore so resuming runs have the latest data
+    saved_rows = run_data.get("outputTable", {}).get("rows", {})
+    output_table_rows = [saved_rows[k] for k in sorted(saved_rows.keys(), key=lambda x: int(x))]
+    if output_table_rows:
+        variables["table"] = build_table_variable(column_keys, output_table_rows)
+
     visited = set()
 
     while current_node:
@@ -228,126 +281,162 @@ def execute_workflow(db, run_ref, run_data):
         if not executor_fn:
             raise Exception(f"Unknown node kind: {node_kind}")
 
+        # pass current table rows into variables so eval node can access them
+        if output_type == "table":
+            variables["_output_table_rows"] = output_table_rows
+
         interpolated_node = interpolate(current_node, variables)
 
-        result = executor_fn(
-            node=interpolated_node,
-            variables=variables,
-            db=db,
-            run_ref=run_ref,
-            run_data=run_data,
+        # ── detect row analyzer before execution ──────────────────────────────
+        is_row_analyzer = (
+            output_type == "table"
+            and node_data.get("tableOutputColumn")
+            and node_data.get("tableOutputColumn") != "exclude"
         )
 
-        write_node_execution(run_ref, current_node, result)
+        if is_row_analyzer:
+            output_column = node_data["tableOutputColumn"]
+            logger.info(f"[Table] Row analyzer node {node_id} — processing {len(output_table_rows)} rows into column '{output_column}'")
 
-        if result.get("pause"):
-            logger.info(f"Run paused at node {node_id}")
-            return
+            result = {"output": None, "outputVariable": None}
 
-        if result.get("error"):
-            raise Exception(f"Node {node_id} failed: {result['error']}")
+            for row_index, row in enumerate(output_table_rows):
+                row_variables = variables.copy()
+                for col_key, col_value in row.items():
+                    row_variables[col_key] = col_value
 
-        output_value = result.get("output")
-        output_variable = result.get("outputVariable")
+                interpolated_row_node = interpolate(current_node, row_variables)
 
-        # ── table mode ────────────────────────────────────────────────────────
-        if output_type == "table":
-
-            if isinstance(output_value, list) and len(output_value) > 0:
-
-                is_per_row = (
-                    len(output_table_rows) > 0 and
-                    node_references_column(node_data, column_keys)
-                )
-
-                if is_per_row:
-                    # per-row producer — run once per existing row, expand table
-                    logger.info(f"[Table] Per-row producer node {node_id} — expanding {len(output_table_rows)} rows")
-                    expanded_rows = []
-                    for existing_row in output_table_rows:
-                        # inject existing row values and re-run
-                        row_variables = variables.copy()
-                        for col_key, col_value in existing_row.items():
-                            row_variables[col_key] = col_value
-
-                        interpolated_row_node = interpolate(current_node, row_variables)
-                        row_result = executor_fn(
-                            node=interpolated_row_node,
-                            variables=row_variables,
-                            db=db,
-                            run_ref=run_ref,
-                            run_data=run_data,
-                        )
-
-                        row_output = row_result.get("output")
-                        if isinstance(row_output, list):
-                            for item in row_output:
-                                new_row = existing_row.copy()  # preserve parent row values
-                                new_row.update(apply_column_mappings(item, node_data))
-                                expanded_rows.append(new_row)
-                        else:
-                            # node returned nothing for this row — keep original row
-                            expanded_rows.append(existing_row)
-
-                    output_table_rows = expanded_rows
-                    logger.info(f"[Table] Expanded to {len(output_table_rows)} rows")
-
-                else:
-                    # global producer — run once, append all items
-                    logger.info(f"[Table] Global row producer node {node_id} — appending {len(output_value)} rows")
-                    for item in output_value:
-                        row_data = apply_column_mappings(item, node_data)
-                        output_table_rows.append(row_data)
-
-                flush_table_to_firestore(run_ref, column_keys, output_table_rows)
-
-            elif node_data.get("tableOutputColumn") and node_data.get("tableOutputColumn") != "exclude":
-                # row analyzer — run once per existing row, add column
-                output_column = node_data["tableOutputColumn"]
-                logger.info(f"[Table] Row analyzer node {node_id} — processing {len(output_table_rows)} rows into column '{output_column}'")
-
-                for row_index, row in enumerate(output_table_rows):
-                    row_variables = variables.copy()
-                    for col_key, col_value in row.items():
-                        row_variables[col_key] = col_value
-
-                    interpolated_row_node = interpolate(current_node, row_variables)
-
-                    row_result = executor_fn(
+                try:
+                    row_result = execute_with_retry(
+                        executor_fn,
+                        node_data=node_data,
                         node=interpolated_row_node,
                         variables=row_variables,
                         db=db,
                         run_ref=run_ref,
                         run_data=run_data,
                     )
+                except Exception as e:
+                    logger.warning(f"[Table] Node {node_id} failed for row {row_index} after retries: {e}")
+                    output_table_rows[row_index][output_column] = None
+                    continue
 
-                    if row_result.get("error"):
-                        logger.warning(f"[Table] Node {node_id} failed for row {row_index}: {row_result['error']}")
-                        output_table_rows[row_index][output_column] = None
+                if row_result.get("error"):
+                    logger.warning(f"[Table] Node {node_id} failed for row {row_index}: {row_result['error']}")
+                    output_table_rows[row_index][output_column] = None
+                else:
+                    row_output = row_result.get("output")
+                    output_table_rows[row_index][output_column] = row_output
+                    run_ref.update({
+                        f"outputTable.rows.{row_index}.{output_column}": row_output,
+                    })
+
+            # Site 2: after row analyzer finishes
+            variables["table"] = build_table_variable(column_keys, output_table_rows)
+            write_node_execution(run_ref, current_node, result)
+
+        else:
+            result = executor_fn(
+                node=interpolated_node,
+                variables=variables,
+                db=db,
+                run_ref=run_ref,
+                run_data=run_data,
+            )
+
+            write_node_execution(run_ref, current_node, result)
+
+            if result.get("pause"):
+                logger.info(f"Run paused at node {node_id}")
+                return
+
+            if result.get("error"):
+                raise Exception(f"Node {node_id} failed: {result['error']}")
+
+            # if eval node ran in table mode, pick up surviving rows
+            if node_kind == "eval" and "output_table_rows" in result:
+                output_table_rows = result["output_table_rows"]
+                flush_table_to_firestore(run_ref, column_keys, output_table_rows)  # renumber keys to stay in sync
+                variables["table"] = build_table_variable(column_keys, output_table_rows)
+                logger.info(f"[Eval] In-memory table updated — {len(output_table_rows)} rows remaining")
+
+            output_value = result.get("output")
+            output_variable = result.get("outputVariable")
+
+            # ── table mode ────────────────────────────────────────────────────
+            if output_type == "table":
+
+                if isinstance(output_value, list) and len(output_value) > 0:
+
+                    is_per_row = (
+                        len(output_table_rows) > 0 and
+                        node_references_column(node_data, column_keys)
+                    )
+
+                    if is_per_row:
+                        logger.info(f"[Table] Per-row producer node {node_id} — expanding {len(output_table_rows)} rows")
+                        expanded_rows = []
+                        for existing_row in output_table_rows:
+                            row_variables = variables.copy()
+                            for col_key, col_value in existing_row.items():
+                                row_variables[col_key] = col_value
+
+                            interpolated_row_node = interpolate(current_node, row_variables)
+
+                            try:
+                                row_result = execute_with_retry(
+                                    executor_fn,
+                                    node_data=node_data,
+                                    node=interpolated_row_node,
+                                    variables=row_variables,
+                                    db=db,
+                                    run_ref=run_ref,
+                                    run_data=run_data,
+                                )
+                            except Exception as e:
+                                logger.warning(f"[Table] Per-row producer node {node_id} failed for row after retries: {e}")
+                                expanded_rows.append(existing_row)
+                                continue
+
+                            row_output = row_result.get("output")
+                            if isinstance(row_output, list):
+                                for item in row_output:
+                                    new_row = existing_row.copy()
+                                    new_row.update(apply_column_mappings(item, node_data))
+                                    expanded_rows.append(new_row)
+                            else:
+                                expanded_rows.append(existing_row)
+
+                        output_table_rows = expanded_rows
+                        logger.info(f"[Table] Expanded to {len(output_table_rows)} rows")
+
                     else:
-                        row_output = row_result.get("output")
-                        output_table_rows[row_index][output_column] = row_output
+                        logger.info(f"[Table] Global row producer node {node_id} — appending {len(output_value)} rows")
+                        for item in output_value:
+                            row_data = apply_column_mappings(item, node_data)
+                            output_table_rows.append(row_data)
+
+                    flush_table_to_firestore(run_ref, column_keys, output_table_rows)
+                    # Site 3: after global/per-row producer flushes
+                    variables["table"] = build_table_variable(column_keys, output_table_rows)
+
+                else:
+                    if output_variable and output_value is not None:
+                        variables[output_variable] = output_value
                         run_ref.update({
-                            f"outputTable.rows.{row_index}.{output_column}": row_output,
+                            f"variables.{output_variable}": output_value,
+                            f"outputVariables.{output_variable}": output_value,
                         })
 
+            # ── single mode ───────────────────────────────────────────────────
             else:
-                # normal node in table mode — save to variables
                 if output_variable and output_value is not None:
                     variables[output_variable] = output_value
                     run_ref.update({
                         f"variables.{output_variable}": output_value,
                         f"outputVariables.{output_variable}": output_value,
                     })
-
-        # ── single mode ───────────────────────────────────────────────────────
-        else:
-            if output_variable and output_value is not None:
-                variables[output_variable] = output_value
-                run_ref.update({
-                    f"variables.{output_variable}": output_value,
-                    f"outputVariables.{output_variable}": output_value,
-                })
 
         # find next node
         outgoing = edges_by_source.get(node_id, [])

@@ -18,11 +18,17 @@ def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:
     label = node_data.get("label", "LLM")
 
     model = node_data.get("model", "gpt-4o")
-    system_prompt = node_data.get("systemPrompt", "")
+    system_prompt = node_data.get("systemPrompt", "") or "You are a helpful assistant."
     user_prompt = node_data.get("userPrompt", "")
     temperature = node_data.get("temperature", 0.7)
     output_variable = node_data.get("outputVariable")
     user_id = run_data.get("triggeredBy")
+
+    # append reference source data to system prompt if configured
+    reference_source_data = node_data.get("referenceSourceData")
+    if reference_source_data:
+        system_prompt = system_prompt + \
+            f"\n\nUse the following text as a reference when producing your response: {reference_source_data}"
 
     if not user_prompt and not system_prompt:
         raise Exception(f"LLM node '{label}' has no prompt configured")

@@ -3,10 +3,46 @@ import os
 import json
 import requests
 from app import keywordsai_chat_completion
+import time
+import random
 
 logger = logging.getLogger(__name__)
 
 APOLLO_MATCH_URL = "https://api.apollo.io/api/v1/people/match"
+
+
+def _sleep_with_jitter(base_seconds: float = 0.3):
+    """Proactive delay with jitter to avoid hitting rate limits."""
+    time.sleep(base_seconds + random.uniform(0, 0.5))
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Check if an exception is a rate limit error."""
+    if isinstance(e, requests.HTTPError):
+        return e.response is not None and e.response.status_code == 429
+    return "rate limit" in str(e).lower()
+
+
+def _apollo_request_with_retry(url: str, headers: dict, params: dict, retries: int = 3) -> dict:
+    """
+    Make an Apollo API request with exponential backoff + jitter on rate limit errors.
+    Applies a proactive jitter delay after every successful call.
+    """
+    for attempt in range(retries):
+        try:
+            response = requests.post(url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
+            _sleep_with_jitter()  # proactive delay after every successful call
+            return response.json()
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < retries - 1:
+                delay = (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(f"Apollo rate limited. Retrying in {delay:.2f}s (attempt {attempt + 1}/{retries})...")
+                time.sleep(delay)
+            else:
+                raise
+
+    raise RuntimeError("Apollo request failed after all retries")
 
 
 def _get_apollo_api_key(db, team_id: str) -> str | None:
@@ -116,14 +152,7 @@ def execute(node: dict, variables: dict, db, run_ref, run_data: dict) -> dict:
     logger.info(f"Apollo node '{label}' enriching: name={name!r}, company={company!r}")
 
     try:
-        response = requests.post(
-            APOLLO_MATCH_URL,
-            headers=headers,
-            params=params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        apollo_result = response.json()
+        apollo_result = _apollo_request_with_retry(APOLLO_MATCH_URL, headers, params)
 
         logger.info(
             "Apollo node full response: %s",
