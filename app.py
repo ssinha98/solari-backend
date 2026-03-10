@@ -13950,6 +13950,308 @@ def list_agent_runs():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+# ─── Agent Store ──────────────────────────────────────────────────────────────
+
+AGENT_STORE_ADMIN_UID = "jyh2RyS8Mvb9OCWF7pKRKEAGxZP2"
+
+
+@app.route('/api/agent-store/publish', methods=['POST'])
+@require_solari_key
+def agent_store_publish():
+    """
+    Copy an agent config (nodes, edges, outputType, tableColumns) into the
+    global agentStore collection.  Only the designated admin user may call
+    this endpoint.
+
+    Request Body:
+    {
+        "user_id":     "firebase_uid",   # must be AGENT_STORE_ADMIN_UID
+        "agent_id":    "agent_id",
+        "name":        "optional display name (defaults to agent name)",
+        "description": "optional description",
+        "tags":        ["optional", "tag", "list"]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id  = data.get("user_id")  or data.get("userId")
+        agent_id = data.get("agent_id") or data.get("agentId")
+
+        if not user_id or not agent_id:
+            return jsonify({"success": False, "error": "Missing required parameters: user_id, agent_id"}), 400
+
+        if user_id != AGENT_STORE_ADMIN_UID:
+            return jsonify({"success": False, "error": "forbidden"}), 403
+
+        db = firestore.client()
+
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        agent_ref = (
+            db.collection("teams").document(team_id)
+              .collection("agents").document(agent_id)
+        )
+        agent_snap = agent_ref.get()
+        if not agent_snap.exists:
+            return jsonify({"success": False, "error": "agent_not_found"}), 404
+
+        agent_data = agent_snap.to_dict() or {}
+        active_version_id = agent_data.get("activeVersionId")
+
+        nodes        = []
+        edges        = []
+        output_type  = "single"
+        table_columns = []
+
+        if active_version_id:
+            version_snap = agent_ref.collection("versions").document(active_version_id).get()
+            if version_snap.exists:
+                vd = version_snap.to_dict() or {}
+                nodes         = vd.get("nodes", [])
+                edges         = vd.get("edges", [])
+                output_type   = vd.get("outputType", "single")
+                table_columns = vd.get("tableColumns", [])
+
+        store_entry = {
+            "agentId":      agent_id,
+            "sourceTeamId": team_id,
+            "name":         data.get("name") or agent_data.get("name") or agent_data.get("label") or agent_id,
+            "description":  data.get("description") or agent_data.get("description") or "",
+            "tags":         data.get("tags") or [],
+            "agentType":    agent_data.get("agentType") or agent_data.get("type") or "workflow",
+            "nodes":        nodes,
+            "edges":        edges,
+            "outputType":   output_type,
+            "tableColumns": table_columns,
+            "publishedAt":  firestore.SERVER_TIMESTAMP,
+            "publishedBy":  user_id,
+        }
+
+        store_ref = db.collection("agentStore").document()
+        store_ref.set(store_entry)
+
+        logger.info(f"[agent_store_publish] published agent {agent_id} → agentStore/{store_ref.id}")
+
+        return jsonify({
+            "success":      True,
+            "storeEntryId": store_ref.id,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in agent_store_publish: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/agent-store/list', methods=['GET', 'POST'])
+@require_solari_key
+def agent_store_list():
+    """
+    Return all entries in the global agentStore collection.
+
+    No authentication restriction — any valid Solari key may list the store.
+
+    Optional Request Body (POST) or Query Params (GET):
+    {
+        "tag": "filter by tag (optional)"
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        tag_filter = data.get("tag") or request.args.get("tag")
+
+        db = firestore.client()
+        query = db.collection("agentStore").order_by("publishedAt", direction=firestore.Query.DESCENDING)
+
+        if tag_filter:
+            query = query.where("tags", "array_contains", tag_filter)
+
+        snaps = query.stream()
+
+        entries = []
+        for snap in snaps:
+            entry = snap.to_dict() or {}
+            entry["id"] = snap.id
+            published_at = entry.get("publishedAt")
+            if hasattr(published_at, "isoformat"):
+                entry["publishedAt"] = published_at.isoformat()
+            entries.append(entry)
+
+        return jsonify({"success": True, "entries": entries}), 200
+
+    except Exception as e:
+        logger.error(f"Error in agent_store_list: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/agent-store/install', methods=['POST'])
+@require_solari_key
+def agent_store_install():
+    """
+    Copy one or more agents from the global agentStore into the requesting
+    user's team as brand-new agents, each with their own first version.
+
+    Request Body:
+    {
+        "user_id":         "firebase_uid",
+        "store_entry_ids": ["storeEntryId1", "storeEntryId2"]
+    }
+
+    Returns:
+    {
+        "success": true,
+        "installed": [
+            { "storeEntryId": "...", "agentId": "...", "name": "..." },
+            ...
+        ],
+        "errors": [
+            { "storeEntryId": "...", "error": "..." },
+            ...
+        ]
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id         = data.get("user_id")         or data.get("userId")
+        store_entry_ids = data.get("store_entry_ids") or data.get("storeEntryIds")
+
+        if not user_id:
+            return jsonify({"success": False, "error": "Missing required parameter: user_id"}), 400
+        if not store_entry_ids or not isinstance(store_entry_ids, list):
+            return jsonify({"success": False, "error": "store_entry_ids must be a non-empty list"}), 400
+
+        db = firestore.client()
+
+        try:
+            team_id = get_team_id_for_uid(db, user_id)
+        except KeyError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+
+        installed = []
+        errors    = []
+
+        for store_entry_id in store_entry_ids:
+            try:
+                store_snap = db.collection("agentStore").document(store_entry_id).get()
+                if not store_snap.exists:
+                    errors.append({"storeEntryId": store_entry_id, "error": "store_entry_not_found"})
+                    continue
+
+                entry = store_snap.to_dict() or {}
+
+                nodes         = entry.get("nodes", [])
+                edges         = entry.get("edges", [])
+                output_type   = entry.get("outputType", "single")
+                table_columns = entry.get("tableColumns", [])
+                agent_type    = entry.get("agentType", "workflow")
+                entry_name    = entry.get("name", "Untitled Agent")
+                description   = entry.get("description", "")
+
+                # create new agent doc
+                new_agent_ref = (
+                    db.collection("teams").document(team_id)
+                      .collection("agents").document()
+                )
+
+                # create first version doc
+                version_ref  = new_agent_ref.collection("versions").document()
+                version_hash = compute_workflow_hash(nodes, edges)
+
+                version_data = {
+                    "label":        "v1",
+                    "hash":         version_hash,
+                    "createdAt":    firestore.SERVER_TIMESTAMP,
+                    "savedBy":      user_id,
+                    "nodes":        nodes,
+                    "edges":        edges,
+                    "outputType":   output_type,
+                    "tableColumns": table_columns,
+                }
+
+                agent_data = {
+                    "name":              entry_name,
+                    "description":       description,
+                    "agentType":         agent_type,
+                    "activeVersionId":   version_ref.id,
+                    "versionCount":      1,
+                    "lastVersionHash":   version_hash,
+                    "installedFromStore": store_entry_id,
+                    "createdAt":         firestore.SERVER_TIMESTAMP,
+                    "updatedAt":         firestore.SERVER_TIMESTAMP,
+                    "createdBy":         user_id,
+                }
+
+                batch = db.batch()
+                batch.set(new_agent_ref, agent_data)
+                batch.set(version_ref, version_data)
+                batch.commit()
+
+                logger.info(
+                    f"[agent_store_install] installed agentStore/{store_entry_id} "
+                    f"→ teams/{team_id}/agents/{new_agent_ref.id}"
+                )
+                installed.append({
+                    "storeEntryId": store_entry_id,
+                    "agentId":      new_agent_ref.id,
+                    "name":         entry_name,
+                })
+
+            except Exception as entry_err:
+                logger.error(f"[agent_store_install] failed for {store_entry_id}: {entry_err}", exc_info=True)
+                errors.append({"storeEntryId": store_entry_id, "error": str(entry_err)})
+
+        return jsonify({
+            "success":   len(errors) == 0,
+            "installed": installed,
+            "errors":    errors,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in agent_store_install: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/agent-store/remove', methods=['POST'])
+@require_solari_key
+def agent_store_remove():
+    """
+    Remove an entry from the global agentStore collection.
+    Only the designated admin user may call this endpoint.
+
+    Request Body:
+    {
+        "user_id":        "firebase_uid",   # must be AGENT_STORE_ADMIN_UID
+        "store_entry_id": "agentStore doc ID"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        user_id        = data.get("user_id")        or data.get("userId")
+        store_entry_id = data.get("store_entry_id") or data.get("storeEntryId")
+
+        if not user_id or not store_entry_id:
+            return jsonify({"success": False, "error": "Missing required parameters: user_id, store_entry_id"}), 400
+
+        if user_id != AGENT_STORE_ADMIN_UID:
+            return jsonify({"success": False, "error": "forbidden"}), 403
+
+        db = firestore.client()
+        store_ref = db.collection("agentStore").document(store_entry_id)
+        if not store_ref.get().exists:
+            return jsonify({"success": False, "error": "store_entry_not_found"}), 404
+
+        store_ref.delete()
+        logger.info(f"[agent_store_remove] deleted agentStore/{store_entry_id}")
+
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        logger.error(f"Error in agent_store_remove: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 if __name__ == '__main__':
     # Get port from environment or default to 5000
     port = int(get_env_var('PORT', default='5000'))
